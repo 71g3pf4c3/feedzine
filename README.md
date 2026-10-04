@@ -75,8 +75,48 @@ full_text = false                # только сводки
 Кэш картинок в `~/.cache/feedzine/img/<preset>/`, имена — sha1 URL:
 повторные выпуски не перекачивают то, что уже лежит.
 
+## Home Manager
+
+flake экспортирует модуль `homeManagerModules.feedzine` — установка, конфиг
+и таймер декларативно:
+
+```nix
+# flake.nix вашего окружения
+inputs.feedzine.url = "github:71g3pf4c3/feedzine";
+```
+
+```nix
+# конфиг home-manager
+imports = [ inputs.feedzine.homeManagerModules.feedzine ];
+
+programs.feedzine = {
+  enable = true;
+  settings = {
+    title = "Мой журнал";
+    out = "~/Books/feedzine";
+    feed = [
+      { name = "Хабр · статьи"; url = "https://habr.com/ru/rss/articles/"; }
+      { name = "Хабр · Python"; url = "https://habr.com/ru/rss/hubs/python/"; max = 5; section = "Хабр"; }
+    ];
+  };
+  timer = {                     # systemd user timer
+    enable = true;              # systemctl --user list-timers feedzine
+    onCalendar = "*-*-* 07:00:00";
+    persistent = true;          # навёрстывать пропущенное
+  };
+};
+```
+
+- `settings` — это `~/.config/feedzine/config.toml`: список `feed`
+  сериализуется в `[[feed]]`, поля те же, что понимает `load_config`.
+- Пока конфигом управляет модуль, `feedzine init` не нужен (и вреден —
+  перепишет управляемый файл).
+- Сервис `feedzine.service` объявляется при любом `enable` — выпуск можно
+  дёрнуть вручную: `systemctl --user start feedzine`.
+
 ## Регулярный выпуск
 
+Пользователям Home Manager таймер даёт модуль (см. выше); вручную —
 systemd user timer (`~/.config/systemd/user/feedzine.timer`):
 
 ```ini

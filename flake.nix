@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -11,6 +15,7 @@
       self,
       nixpkgs,
       flake-utils,
+      home-manager,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -18,7 +23,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
         feedzine = pkgs.stdenv.mkDerivation rec {
           pname = "feedzine";
-          version = "0.3.0";
+          version = "0.4.0";
 
           src = self;
 
@@ -45,6 +50,35 @@
             platforms = platforms.unix;
           };
         };
+
+        # Минимальная конфигурация Home Manager с включённым модулем:
+        # проверяет eval модуля и сборку сгенерированного config.toml
+        # (файл попадает в home-files, значит реально собирается).
+        hm-module-check = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.feedzine
+            {
+              home.username = "ci";
+              home.homeDirectory = "/home/ci";
+              home.stateVersion = "25.11";
+              programs.feedzine = {
+                enable = true;
+                settings = {
+                  title = "CI";
+                  out = "/tmp/feedzine-out";
+                  feed = [
+                    {
+                      name = "Хабр · тест";
+                      url = "https://habr.com/ru/rss/articles/";
+                    }
+                  ];
+                };
+                timer.enable = true;
+              };
+            }
+          ];
+        };
       in
       {
         packages.default = feedzine;
@@ -70,6 +104,8 @@
           touch $out
         '';
 
+        checks.hm-module = hm-module-check.activationPackage;
+
         devShells.default = pkgs.mkShell {
           packages = [
             (pkgs.python3.withPackages (ps: [
@@ -80,5 +116,9 @@
           ];
         };
       }
-    );
+    )
+    // {
+      homeManagerModules.feedzine = import ./nix/hm-module.nix self;
+      homeManagerModules.default = self.homeManagerModules.feedzine;
+    };
 }
