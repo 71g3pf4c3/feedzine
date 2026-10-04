@@ -893,7 +893,7 @@ class ClassifyCfg(BaseModel):
 class LlmCfg(BaseModel):
     """[llm] — локальная маленькая LLM через llama.cpp (GGUF).
 
-    Классификация/выжимка качественнее ngram, но медленнее: на CPU
+    Классификация/выжимка качественнее, но медленнее: на CPU
     считайте секунды на статью. Промах (нет модели/бинария/таймаут)
     молча уходит на запасной путь — сборка не ломается.
     """
@@ -905,6 +905,7 @@ class LlmCfg(BaseModel):
     timeout: int = 180           # сек на вызов
     classify: bool = False       # рубрики через LLM
     summarize: bool = False       # выжимка «Коротко:» через LLM
+    dedup: bool = False           # кросс-языковое слияние дублей по заголовкам
     keep_issues: int = 0        # 0 — глобальный keep_issues
 
 
@@ -1394,6 +1395,38 @@ def _llm_classify(cfg, cent, title, html):
     return None
 
 
+def _llm_dedup(cfg, articles):
+    """Кросс-языковое слияние дублей: LLM смотрит список заголовков.
+
+    ngram не видит дубли через алфавиты (русская новость и её же
+    английский пересказ не делят грамм); LLM на списке заголовков
+    справляется. Один вызов на выпуск, ответ кэшируется. Длинные
+    выпуски (>150) пропускаем: не влезут в контекст маленькой модели.
+    -> (статьи без дублей, сколько слито)
+    """
+    if len(articles) < 2 or len(articles) > 150:
+        return articles, 0
+    listing = "\n".join(f"{i}. {it['title']}" for i, it in enumerate(articles))
+    out = llm_complete(
+        cfg,
+        "Ты — редактор. Ниже пронумерованные заголовки статей одного "
+        "выпуска. Найди дубликаты одной и той же новости, в том числе на "
+        "разных языках. Ответь только парами номеров вида i=j, по паре "
+        "на строку, без пояснений. Если дублей нет — ровно одно слово: НЕТ.",
+        listing, 200)
+    if not out or out.strip().splitlines()[0].strip().casefold() == "нет":
+        return articles, 0
+    drop = set()
+    for a, b in re.findall(r"(\d+)\D+(\d+)", out):
+        a, b = int(a), int(b)
+        if 0 <= a < len(articles) and 0 <= b < len(articles) and a != b:
+            drop.add(max(a, b))           # ранний остаётся, поздний дубль — вон
+    if not drop:
+        return articles, 0
+    kept = [it for i, it in enumerate(articles) if i not in drop]
+    return kept, len(articles) - len(kept)
+
+
 def _llm_summarize(cfg, html, title=""):
     """Выжимка от LLM: 1–2 предложения, по-русски, без кавычек. '' — мимо."""
     out = llm_complete(
@@ -1754,6 +1787,10 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
         articles, merged = _dedup_similar(articles, cfg.dedup_threshold)
         if merged:
             log(f"{title}: слито похожих статей из разных фидов: {merged}")
+    if cfg.llm and cfg.llm.dedup:
+        articles, merged = _llm_dedup(cfg, articles)
+        if merged:
+            log(f"{title}: LLM слил кросс-языковых дублей: {merged}")
 
     # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается;
     # деградации (полный текст не взялся, картинки 403) собираются
@@ -2131,6 +2168,119 @@ def analyze_state(cfg):
         "seen_total": len(st.get("seen") or {}),
         "seen_last7": last7,
     }
+
+
+def run_gc(cfg, days=30, seen_days=0):
+    """Убрать мусор: старые картинки кэша, протухший пул ретраев, seen.
+
+    Картинки старше days выбрасываются (переезд статьи обратно в
+    накопитель докачает их заново — путь идемпотентен по sha1 URL).
+    -> (файлов удалено, байт освобождено)
+    """
+    st = load_state(cfg.workdir)
+    removed, freed = 0, 0
+    cutoff = time.time() - days * 86400
+    imgroot = os.path.join(cfg.workdir, "img")
+    if os.path.isdir(imgroot):
+        for root, _dirs, files in os.walk(imgroot):
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        freed += os.path.getsize(p)
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    pass
+    # пул ретраев, которые уже не докатнутся (правило то же, что в _retry_fulltext)
+    pool = st.get("retry_fulltext") or {}
+    today = datetime.date.today()
+    for guid, e in list(pool.items()):
+        added = datetime.datetime.fromisoformat(e.get("added") or "1970-01-01")
+        if e.get("tries", 0) >= RETRY_MAX_TRIES \
+                or (today - added.date()).days > RETRY_MAX_DAYS:
+            pool.pop(guid)
+    # seen по желанию: старые guid не выбрасываем автоматически — только явным флагом
+    if seen_days > 0:
+        horizon = (today - datetime.timedelta(days=seen_days)).isoformat()
+        st["seen"] = {g: d for g, d in st["seen"].items() if d >= horizon}
+    save_state(cfg.workdir, st)
+    log(f"gc: картинок удалено {removed} ({freed / 1e6:.1f} МБ); "
+        f"ретраев протухло: см. state; seen: {len(st['seen'])} записей")
+    return removed, freed
+
+
+def run_doctor(cfg, net=False):
+    """Проверка окружения: что нужно выпуску — на месте ли.
+
+    -> 0 всё в порядке, 1 есть проблемы (warn не считается проблемой).
+    """
+    rows, bad = [], 0
+
+    def check(name, ok, note="", warn=False):
+        nonlocal bad
+        mark = "[green]✓[/green]" if ok else ("[yellow]?[/yellow]" if warn else "[red]✗[/red]")
+        if not ok and not warn:
+            bad = 1
+        rows.append((name, mark, note))
+
+    check("конфиг", True, f"{len(cfg.feed)} фидов, "
+          f"{len(cfg.journal)} журналов")
+    for label, path in (("out", cfg.out), ("workdir", cfg.workdir)):
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".feedzine-probe")
+            open(probe, "w").close()
+            os.remove(probe)
+            check(f"{label}: {path}", True)
+        except OSError as e:
+            check(f"{label}: {path}", False, str(e)[:60])
+    check("pandoc", bool(shutil.which("pandoc")),
+          "" if shutil.which("pandoc") else "не в PATH — EPUB не соберётся")
+    font = os.environ.get("FEEDZINE_FONT") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fonts", "cover.ttf")
+    if os.path.exists(font):
+        check("шрифт обложки", True, font)
+    else:
+        check("шрифт обложки", False,
+              "нет ни FEEDZINE_FONT, ни fonts/cover.ttf — Pillow fallback",
+              warn=True)
+    if cfg.llm:
+        exe = shutil.which(cfg.llm.binary)
+        check(f"llm: {cfg.llm.binary}", bool(exe),
+              "" if exe else "не в PATH — LLM уйдёт на ngram/extractive")
+        model = os.environ.get("FEEDZINE_LLM") or cfg.llm.model
+        model = os.path.expanduser(model) if model else ""
+        check("llm: модель", bool(model and os.path.exists(model)),
+              model or "не задан ([llm] model / FEEDZINE_LLM)")
+        check("llm: шаблон", cfg.llm.template in ("chatml", "llama3", "gemma", "raw"),
+              cfg.llm.template)
+    if cfg.classify:
+        seeded = [n for n, s in cfg.classify.section.items() if s.seeds]
+        check("classify: рубрики с сидами", bool(seeded),
+              f"{len(seeded)}/{len(cfg.classify.section)}")
+        check("classify: порог", 0 < cfg.classify.threshold <= 1,
+              str(cfg.classify.threshold))
+    check("dedup_threshold", 0 <= cfg.dedup_threshold <= 1,
+          str(cfg.dedup_threshold))
+    if net:
+        ok_n, err_n = 0, 0
+        for fd in cfg.feed:
+            try:
+                parse_feed(http_get(fd.url, timeout=10, retries=0))
+                ok_n += 1
+            except Exception as e:  # noqa: BLE001
+                err_n += 1
+                check(f"фид: {fd.name or fd.url}", False, _errcode(e))
+        check("фиды", True, f"живых {ok_n}, лежащих {err_n}")
+    t = Table(title="feedzine doctor")
+    t.add_column("проверка")
+    t.add_column("статус")
+    t.add_column("детали")
+    for name, mark, note in rows:
+        t.add_row(name, mark, note)
+    console.print(t)
+    return bad
 
 
 def classify_preview(cfg):
@@ -2788,6 +2938,25 @@ def classify_cmd(config: str = CONFIG_OPT,
     console.print(t)
     if below:
         console.print(f"ниже порога (останутся в секции фида): {len(below)}")
+
+
+@app.command("gc")
+def gc_cmd(config: str = CONFIG_OPT,
+           days: int = typer.Option(30, "--days", min=1,
+                                    help="картинки кэша старше N дней — в мусор"),
+           seen_days: int = typer.Option(0, "--seen-days", min=0,
+                                          help="обрезать seen старше N дней "
+                                               "(0 = не трогать)")):
+    """убрать мусор: старые картинки кэша, протухший пул ретраев"""
+    run_gc(_load(config), days, seen_days)
+
+
+@app.command("doctor")
+def doctor_cmd(config: str = CONFIG_OPT,
+               net: bool = typer.Option(False, "--net",
+                                         help="и фиды потрогать (сеть)")):
+    """проверка окружения: pandoc, шрифт, LLM, пути"""
+    raise typer.Exit(run_doctor(_load(config), net))
 
 
 @app.command("tui")

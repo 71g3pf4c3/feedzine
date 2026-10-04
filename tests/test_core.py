@@ -7,6 +7,7 @@ import os
 import zipfile
 
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -761,6 +762,88 @@ def test_issue_dedup_cross_feed(tmp_path, monkeypatch):
     body = "".join(z.read(n).decode() for n in z.namelist()
                    if n.startswith("EPUB/text/ch"))
     assert body.count("<h3>Статья два</h3>") == 1   # не два раза из двух фидов
+
+
+# ---------------------------------------------------------------- gc и doctor
+
+def test_gc_images_and_stale_retry(tmp_path):
+    cfg = fz.Config(title="Ж", out=str(tmp_path / "out"),
+                    workdir=str(tmp_path / "wd"))
+    img = tmp_path / "wd" / "img" / "tiny"
+    img.mkdir(parents=True)
+    (img / "old.jpg").write_bytes(b"x" * 100)
+    (img / "new.jpg").write_bytes(b"y" * 50)
+    old = time.time() - 40 * 86400
+    os.utime(img / "old.jpg", (old, old))
+    st = fz.load_state(str(tmp_path / "wd"))
+    st["retry_fulltext"]["g1"] = {"title": "T", "tries": 9,
+                                  "added": "2026-01-01T00:00:00"}
+    st["retry_fulltext"]["g2"] = {"title": "T", "tries": 1,
+                                  "added": datetime.date.today().isoformat()}
+    st["seen"] = {"a": "2026-01-01", "b": datetime.date.today().isoformat()}
+    fz.save_state(str(tmp_path / "wd"), st)
+    removed, freed = fz.run_gc(cfg, days=30, seen_days=30)
+    assert removed == 1 and freed == 100
+    assert not (img / "old.jpg").exists() and (img / "new.jpg").exists()
+    st = fz.load_state(str(tmp_path / "wd"))
+    assert "g1" not in st["retry_fulltext"]      # попытки исчерпаны
+    assert "g2" in st["retry_fulltext"]
+    assert "a" not in st["seen"] and "b" in st["seen"]
+
+
+def test_doctor_offline(tmp_path, monkeypatch):
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    monkeypatch.setenv("FEEDZINE_FONT", "/nonexistent.ttf")
+    assert fz.run_doctor(fz._load(str(cfgf))) == 0     # warn шрифта — не провал
+    # без pandoc — провал
+    monkeypatch.setattr(fz.shutil, "which", lambda b: None)
+    assert fz.run_doctor(fz._load(str(cfgf))) == 1
+
+
+def test_doctor_llm_model_missing(tmp_path):
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[llm]\nmodel = "/nonexistent.gguf"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    assert fz.run_doctor(fz._load(str(cfgf))) == 1
+
+
+def test_llm_dedup_cross_language(tmp_path, monkeypatch):
+    # русский оригинал и английский пересказ — ngram не видит, LLM да
+    cfg = _llm_cfg(tmp_path, classify=True)
+    arts = [
+        {"title": "Вышла бета Ubuntu 26.10 с ядром Linux 7.3",
+         "html": "<p>Canonical выпустила бета</p>"},
+        {"title": "Ubuntu 26.10 beta released with Linux 7.3 kernel",
+         "html": "<p>Canonical releases beta</p>"},
+        {"title": "KDE Plasma 6.8: tiled windows",
+         "html": "<p>совсем другая новость</p>"},
+    ]
+    monkeypatch.setattr(fz, "llm_complete", lambda *a, **kw: "0=1")
+    kept, merged = fz._llm_dedup(cfg, arts)
+    assert merged == 1
+    assert [k["title"] for k in kept] == [arts[0]["title"], arts[2]["title"]]
+
+
+def test_llm_dedup_no_dups(tmp_path, monkeypatch):
+    cfg = _llm_cfg(tmp_path)
+    arts = [{"title": f"Новость {i}", "html": "<p>x</p>"} for i in range(3)]
+    monkeypatch.setattr(fz, "llm_complete", lambda *a, **kw: "НЕТ")
+    kept, merged = fz._llm_dedup(cfg, arts)
+    assert merged == 0 and len(kept) == 3
+
+
+def test_llm_dedup_too_many_skipped(tmp_path):
+    cfg = _llm_cfg(tmp_path)
+    arts = [{"title": f"t{i}", "html": "<p>x</p>"} for i in range(151)]
+    kept, merged = fz._llm_dedup(cfg, arts)
+    assert merged == 0 and len(kept) == 151
 
 
 def test_article_md_summarize_note(monkeypatch, tmp_path):
