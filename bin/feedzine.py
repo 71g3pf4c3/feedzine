@@ -37,6 +37,7 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from urllib.parse import urljoin
 
 import httpx
 import typer
@@ -210,6 +211,8 @@ def load_state(workdir):
     st.setdefault("issue", {})
     st.setdefault("pending", {})
     st.setdefault("last_emit", {})
+    st.setdefault("down_feeds", {})
+    st.setdefault("retry_fulltext", {})
     return st
 
 
@@ -288,34 +291,51 @@ def img_name(url):
     return hashlib.sha1(url.encode()).hexdigest()[:16] + ".jpg"
 
 
+def _errcode(e):
+    """Короткий код ошибки для текста выпуска: '403', 'таймаут', 'сеть'."""
+    s = str(e)
+    m = re.search(r"\b(4\d\d|5\d\d)\b", s)
+    if m:
+        return m.group(1)
+    if "timed out" in s or "Timeout" in s:
+        return "таймаут"
+    return (s[:24] + "…") if len(s) > 24 else (s or "сеть")
+
+
 def process_image(url, imgdir, opts, base=None, q=None):
     """Скачивает и обрабатывает под e-ink (true gray, бокс, baseline JPEG).
 
     Относительные URL (/img/x.png) резолвятся от base (origin статьи).
     q — переопределение JPEG quality (None → качество пресета).
-    Идемпотентно: готовый файл в кэше не трогаем. -> имя локального файла или None.
+    Идемпотентно: готовый файл в кэше не трогаем.
+    -> (имя локального файла | None, код ошибки | None).
     """
-    if url.startswith("/") and base:
-        url = base.rstrip("/") + url
+    if url.startswith("data:"):
+        pass
+    elif base and not url.startswith(("http://", "https://")):
+        # относительные /img/x.png и img/x.png — резолвим от origin
+        url = urljoin(base, url)
     name = img_name(url)
     dst = f"{imgdir}/{name}"
     if os.path.exists(dst):
-        return name
+        return name, None
     try:
         raw = http_get(_abs_url(url), timeout=40, binary=True)
     except Exception as e:  # noqa: BLE001
         log(f"  ! картинка не скачалась: {url[:60]}… ({e})")
-        return None
+        return None, _errcode(e)
     if not HAS_PIL:
         os.makedirs(imgdir, exist_ok=True)
         with open(dst, "wb") as f:
             f.write(raw)
-        return name
+        return name, None
     try:
         im = Image.open(io.BytesIO(raw))
         im.load()
     except Exception:
-        return None
+        return None, "битый файл"
+    if im.mode in ("P", "LA", "PA"):
+        im = im.convert("RGBA")   # палитра с прозрачностью — без варнингов PIL
     pr = PRESETS[opts.preset]
     if pr["gray"]:
         im = im.convert("L")
@@ -327,7 +347,7 @@ def process_image(url, imgdir, opts, base=None, q=None):
             im = im.resize((w, max(1, round(im.height * w / im.width))))
     os.makedirs(imgdir, exist_ok=True)
     im.save(dst, "JPEG", quality=q or pr["q"], optimize=True)  # baseline, не progressive
-    return name
+    return name, None
 
 
 def _abs_url(u):
@@ -335,21 +355,30 @@ def _abs_url(u):
 
 
 def rewrite_images(html, imgdir, opts, rel="../img", base=None, q=None):
-    """<img src> → локальный rel/<hash>.jpg. Возвращает (html, [локальные имена])."""
-    done = []
+    """<img src> → локальный rel/<hash>.jpg; нес скачавшиеся — заглушка
+    в тексте. -> (html, [локальные имена], [(url, код ошибки)]).
+    """
+    done, failed = [], []
 
     def _sub(m):
         url = m.group(1)
         if url.startswith("data:"):
             return m.group(0)
-        name = process_image(url, imgdir, opts, base, q=q)
+        # трекинг-пиксели (medium _/stat и подобные) — не контент,
+        # выкидываем молча, без заглушки и без 403-шума
+        if re.search(r"(/stat\?|/_/stat|pixel|beacon|/collect\?|analytics)",
+                     url, re.I):
+            return ""
+        name, err = process_image(url, imgdir, opts, base, q=q)
         if name:
             done.append(name)
             return m.group(0).replace(url, f"{rel}/{name}")
-        return ""  # битая картинка — выкидываем тег
+        # заглушка: читатель видит, что картинка была, но не взялась
+        failed.append((url, err))
+        return (f'<p>[картинка не скачалась: {err} · {url[:80]}]</p>')
 
     out = re.sub(r'<img\b[^>]*src="([^"]+)"[^>]*/?>', _sub, html)
-    return out, done
+    return out, done, failed
 
 
 # ---------------------------------------------------------------- обложка
@@ -948,13 +977,19 @@ def collect_items(cfg, opts):
     """
     st = load_state(cfg.workdir)
     fresh, all_guids = [], set()
+    down = st.setdefault("down_feeds", {})
     for fd in cfg.feed:
         url = fd.url
         try:
             ftitle, items = parse_feed(http_get(url))
         except Exception as e:  # noqa: BLE001
             log(f"  ! фид {fd.name or url} не прочитался: {e}")
+            # заглушка: помечаем деградацию, читатель узнает в выпуске;
+            # поднялся — запись снимется и статьи приедут сами (unseen)
+            down[url] = {"name": fd.name or url, "jid": fd.journal or "main",
+                         "error": _errcode(e), "since": datetime.date.today().isoformat()}
             continue
+        down.pop(url, None)
         if not fd.name:
             # имя фида по умолчанию — его собственный title
             fd.name = ftitle or re.sub(r"^https?://(?:www\.)?", "", url)[:40]
@@ -1012,21 +1047,34 @@ def _item_text_len(html):
 def _md_prose_len(md):
     """Объём «прозы» в markdown: картинки/ссылки/разметка не считаются.
 
-    Это гейт пустого говна: статья-ссылка без контента даёт ~0.
+    Это гейт пустого говна: статья-ссылка без контента даёт ~0. Заглушки
+    нес скачавшихся картинок тоже не проза — иначе пачка битых картинок
+    прошла бы фильтр как текст.
     """
-    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", md)        # картинки не текст
+    t = re.sub(r"\[картинка не скачалась: [^\]]*\]", " ", md)
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", t)          # картинки не текст
     t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)        # ссылки -> их текст
     t = re.sub(r"```.*?```", " ", t, flags=re.S)          # код не проза
     t = re.sub(r"[#*_>`~|\[\]-]+", " ", t)                # разметка
     return len(" ".join(t.split()))
 
 
-def article_md(item, cfg, imgdir, opts):
+def _md_img_count(md):
+    """Скачавшиеся картинки в markdown-теле (заглушки не в счёт)."""
+    return len(re.findall(r"!\[[^\]]*\]\(img/[^)]+\)", md))
+
+
+def article_md(item, cfg, imgdir, opts, failures=None):
     """Статья -> markdown: шапка с метаданными + сводка/полный текст.
 
     None — пустое говно: после зачистки ссылок/картинок в теле меньше
     min_article_chars прозы (голая ссылка, заглушка paywall, пустая
     сводка). Вызывавший должен такую статью из выпуска выкинуть.
+
+    failures — список для фиксации деградаций: полный текст не взялся
+    (kind=fulltext, уйдёт в пул ретраев), картинки не скачались
+    (kind=image). Деградации отмечаются в тексте выпуска, читатель
+    видит, что контент неполный.
     """
     fd = item["feed"]
     ft = fd.full_text if fd.full_text is not None else cfg.full_text
@@ -1036,29 +1084,50 @@ def article_md(item, cfg, imgdir, opts):
     want_full = (ft in (True, "always")
                  or (ft == "auto" and (habr_id(item["link"]) or stub)))
     html, author = item["html"], item["author"]
+    notes, ft_err = [], None
     if want_full and item["link"]:
         try:
             full, fauthor = fetch_full(item["link"], sniff=item.get("html"))
             if full:
                 html, author = full, author or fauthor
+            else:
+                ft_err = "контент не извлёкся"
         except Exception as e:  # noqa: BLE001
+            ft_err = _errcode(e)
             log(f"  ! полный текст не взялся: {e}")
+        if ft_err and failures is not None:
+            failures.append({"kind": "fulltext", "guid": item.get("guid"),
+                             "title": item["title"], "link": item["link"],
+                             "date": (item["date"].isoformat()
+                                      if item["date"] else None),
+                             "html": item["html"], "author": item["author"],
+                             "feed": {"name": fd.name, "full_text": fd.full_text,
+                                      "section": fd.section,
+                                      "min_article_chars": fd.min_article_chars},
+                             "error": ft_err})
+    img_fails = []
     if not opts.text_only:
         base = None
         if item["link"]:
             m = re.match(r"https?://[^/]+", item["link"])
             if m:
                 base = m.group(0)
-        html, _ = rewrite_images(html, imgdir, opts, rel=f"img/{opts.preset}",
-                                 base=base, q=cfg.img_quality or None)
+        html, _done, img_fails = rewrite_images(html, imgdir, opts,
+                                                rel=f"img/{opts.preset}",
+                                                base=base, q=cfg.img_quality or None)
     else:
         html = re.sub(r"<img\b[^>]*>", "", html)
+    if img_fails and failures is not None:
+        failures.append({"kind": "image", "count": len(img_fails),
+                         "guid": item.get("guid")})
     body = html_to_md(html) or ""
     # внутренние заголовки статьи демо́тимся (fenced-коды не трогаем)
     body = demote_headings(body)
     min_chars = (fd.min_article_chars if fd.min_article_chars is not None
                  else cfg.min_article_chars)
-    if _md_prose_len(body) < min_chars:
+    # фото-пост («@x posted a photo» с подписью) — картинка и есть контент:
+    # гейт действует только на текст без картинок
+    if _md_prose_len(body) < min_chars and _md_img_count(body) == 0:
         log(f"  − пустое не пошло в выпуск: {item['title'][:60]}")
         return None
     d = item["date"].strftime("%d.%m.%Y") if item["date"] else ""
@@ -1067,7 +1136,23 @@ def article_md(item, cfg, imgdir, opts):
     if d:
         head += f" · {d}"
     head += f" · [оригинал]({item['link']})*" if item["link"] else "*"
-    return f"### {item['title']}\n\n{head}\n\n{body}\n"
+    # ограничения — в текст выпуска, а не молча
+    if ft_err:
+        notes.append(f"полный текст не взялся ({ft_err}) — попробую снова "
+                     f"в следующем выпуске")
+    if img_fails:
+        notes.append(f"картинок не скачалось: {len(img_fails)} "
+                     f"({_errcode_list(img_fails)})")
+    note = ("\n\n" + "\n\n".join(f"> ⚠ {n}" for n in notes)) if notes else ""
+    return f"### {item['title']}\n\n{head}{note}\n\n{body}\n"
+
+
+def _errcode_list(fails):
+    """Сводка кодов ошибок картинок: '403 ×3, таймаут'."""
+    cnt = {}
+    for _url, err in fails:
+        cnt[err] = cnt.get(err, 0) + 1
+    return ", ".join(f"{k} ×{v}" if v > 1 else k for k, v in cnt.items())
 
 
 # ---------------------------------------------------------------- поставка
@@ -1229,11 +1314,12 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
     date_str = now.strftime("%Y-%m-%d")
     articles = _pending_prepare(pending)
 
-    # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается
-    parts, first_img = {}, None
+    # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается;
+    # деградации (полный текст не взялся, картинки 403) собираются
+    parts, first_img, failures = {}, None, []
     with console.status(f"{title}: {len(articles)} статей"):
         for it in articles:
-            m = article_md(it, cfg, imgdir, opts)
+            m = article_md(it, cfg, imgdir, opts, failures=failures)
             if m is None:
                 continue
             parts.setdefault(_section(it["feed"]), []).append(m + "\n")
@@ -1246,6 +1332,30 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
         pending.clear()
         st["last_emit"][jid] = date_str
         return True
+
+    # пул ретраев: полный текст не взялся — попробуем в следующем выпуске
+    pool = st.setdefault("retry_fulltext", {})
+    img_total = 0
+    for f in failures:
+        if f["kind"] == "fulltext" and f.get("guid"):
+            old = pool.get(f["guid"]) or {}
+            pool[f["guid"]] = {**f, "jid": jid, "kind": None,
+                               "tries": old.get("tries", 0),
+                               "added": old.get("added") or now.isoformat()}
+        elif f["kind"] == "image":
+            img_total += f.get("count", 0)
+
+    # отдельный граф: что не попало в выпуск — фиды лежат, полные тексты
+    # в ретрае, картинки не скачались. Читатель видит ограничения.
+    report = [f"— фид «{d['name']}» не синкался с {d.get('since')}: {d.get('error')}"
+              for d in st.get("down_feeds", {}).values() if d.get("jid") == jid]
+    report += [f"— «{e['title'][:60]}»: полный текст не взялся ({e.get('error')}); "
+               f"попытка {e.get('tries', 0) + 1}/{RETRY_MAX_TRIES}"
+               for e in pool.values() if e.get("jid") == jid]
+    if img_total:
+        report.append(f"— картинок не скачалось: {img_total} (403/таймаут/битые)")
+    if report:
+        parts["Что не попало в выпуск"] = ["\n".join(report) + "\n"]
 
     st["issue"][jid] = st["issue"].get(jid, 0) + 1
     n = st["issue"][jid]
@@ -1293,6 +1403,43 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
     return False
 
 
+RETRY_MAX_TRIES = 5      # попыток полного текста на статью
+RETRY_MAX_DAYS = 14      # после — сдаёмся (в тексте уже есть пометка)
+
+
+def _retry_fulltext(cfg, st, now):
+    """Повторная выгрузка полного текста для провалившихся.
+
+    Успех -> статья уезжает в копилку журнала секцией «Докатнуто · …»
+    и выйдет следующим выпуском; неудача -> счётчик попыток. Исчерпал
+    попытки/устарел -> выкидываем (заглушка со сводкой уже вышла).
+    """
+    pool = st.get("retry_fulltext") or {}
+    for guid, e in list(pool.items()):
+        added = datetime.datetime.fromisoformat(e.get("added") or "1970-01-01")
+        if e.get("tries", 0) >= RETRY_MAX_TRIES or (now - added).days > RETRY_MAX_DAYS:
+            pool.pop(guid)
+            continue
+        full = None
+        try:
+            full, _fa = fetch_full(e["link"], sniff=e.get("html"))
+        except Exception:  # noqa: BLE001
+            pass
+        if not full:
+            e["tries"] = e.get("tries", 0) + 1
+            continue
+        pool.pop(guid)
+        fdp = dict(e.get("feed") or {})
+        fdp["section"] = f"Докатнуто · {fdp.get('section') or fdp.get('name') or 'RSS'}"
+        item = {"title": e["title"], "link": e["link"], "guid": guid,
+                "date": (datetime.datetime.fromisoformat(e["date"])
+                         if e.get("date") else None),
+                "html": full, "author": e.get("author") or "",
+                "tags": [], "feed": SimpleNamespace(**fdp)}
+        log(f"  + докатка: полный текст взялся — {e['title'][:60]}")
+        _pending_add(st["pending"].setdefault(e.get("jid", "main"), []), [item])
+
+
 def run_issue(cfg, opts):
     """Сборка выпусков по готовому Config (пути уже раскрыты). -> код возврата.
 
@@ -1308,6 +1455,10 @@ def run_issue(cfg, opts):
     with console.status("читаю фиды…"):
         fresh, all_guids, st = collect_items(cfg, opts)
 
+    now = datetime.datetime.now()
+    # докатка: повторяем полные тексты, провалившиеся в прошлых выпусках
+    _retry_fulltext(cfg, st, now)
+
     # свежие статьи — по журналам
     by_j = {}
     for it in fresh:
@@ -1315,9 +1466,11 @@ def run_issue(cfg, opts):
     for jid, items in by_j.items():
         _pending_add(st["pending"].setdefault(jid, []), items)
 
-    now = datetime.datetime.now()
-
     if opts.dry_run:
+        pool_n = len(st.get("retry_fulltext") or {})
+        down_n = len(st.get("down_feeds") or {})
+        extra = (f"; ретраев полного текста {pool_n}"
+                 + (f"; фидов лежит {down_n}" if down_n else ""))
         for jid in _journal_ids(cfg, st):
             title, _outdir, period, _keep = _journal_cfg(cfg, jid)
             pend = st["pending"].get(jid, [])
@@ -1327,6 +1480,7 @@ def run_issue(cfg, opts):
             for it in pend[:10]:
                 fd = it["feed"]
                 log(f"  {fd.get('section') or fd.get('name') or 'RSS'} :: {it['title']}")
+        log(f"[dry-run] деградации{extra or ': нет'}")
         return 0
 
     date_str = now.strftime("%Y-%m-%d")

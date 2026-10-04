@@ -89,7 +89,8 @@ def test_parse_dates():
 
 def test_state_roundtrip(tmp_path):
     st = fz.load_state(str(tmp_path))
-    assert st == {"seen": {}, "issue": {}, "pending": {}, "last_emit": {}}
+    assert st == {"seen": {}, "issue": {}, "pending": {}, "last_emit": {},
+                  "down_feeds": {}, "retry_fulltext": {}}
     st["seen"]["x"] = "2026-10-04"
     st["issue"]["main"] = 3
     fz.save_state(str(tmp_path), st)
@@ -99,7 +100,8 @@ def test_state_roundtrip(tmp_path):
 def test_state_bad_json(tmp_path):
     (tmp_path / "state.json").write_text("{")
     assert fz.load_state(str(tmp_path)) == {
-        "seen": {}, "issue": {}, "pending": {}, "last_emit": {}}
+        "seen": {}, "issue": {}, "pending": {}, "last_emit": {},
+        "down_feeds": {}, "retry_fulltext": {}}
 
 
 # ---------------------------------------------------------------- habr
@@ -193,16 +195,42 @@ def test_img_name_stable():
 
 def test_rewrite_images_data_uri_kept():
     html = '<img src="data:image/png;base64,xxxx"/>'
-    out, done = fz.rewrite_images(html, "/nonexistent", fz.RunOpts(preset="tiny"))
-    assert done == [] and "data:" in out
+    out, done, failed = fz.rewrite_images(html, "/nonexistent", fz.RunOpts(preset="tiny"))
+    assert done == [] and failed == [] and "data:" in out
 
 
-def test_rewrite_images_bad_url_dropped():
+def test_rewrite_images_bad_url_placeholder():
+    # битый URL не выбрасывает статью: на его месте остаётся заглушка
     html = '<p>до</p><img src="https://invalid.invalid/x.png"/><p>после</p>'
-    out, done = fz.rewrite_images(html, "/nonexistent", fz.RunOpts(preset="tiny"))
-    assert done == []
+    out, done, failed = fz.rewrite_images(html, "/nonexistent", fz.RunOpts(preset="tiny"))
+    assert done == [] and len(failed) == 1 and failed[0][0] == "https://invalid.invalid/x.png"
     assert "<img" not in out
     assert "до" in out and "после" in out
+    assert "картинка не скачалась" in out
+
+
+def test_rewrite_images_tracking_pixel_dropped():
+    # трекинг-пиксель вырезается молча, без заглушки в тексте
+    html = '<p>текст</p><img src="https://medium.com/_/stat?event=view"/>'
+    out, done, failed = fz.rewrite_images(html, "/nonexistent", fz.RunOpts(preset="tiny"))
+    assert done == [] and failed == []
+    assert "текст" in out and "<img" not in out and "картинка" not in out
+
+
+def test_process_image_relative_url(monkeypatch, tmp_path):
+    # относительный URL резолвится от origin статьи, а не падает как битый
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["url"] = url
+        raise fz.httpx.ConnectError("нет сети")
+
+    monkeypatch.setattr(fz, "http_get", fake_get)
+    name, err = fz.process_image("/featured/a.png", str(tmp_path),
+                                  fz.RunOpts(preset="tiny"),
+                                  base="https://x.io/posts/1.html")
+    assert seen["url"] == "https://x.io/featured/a.png"
+    assert name is None and err is not None and "unknown url type" not in err
 
 
 # ---------------------------------------------------------------- обложка
@@ -357,7 +385,92 @@ def test_issue_skips_junk_articles(tmp_path, monkeypatch):
     z = zipfile.ZipFile(epubs[0])
     body = b"".join(z.read(n) for n in z.namelist() if n.endswith(".xhtml"))
     assert "Статья два".encode() in body          # нормальная прошла
-    assert "Статья один".encode() not in body     # пустая выкинута
+    assert "читай".encode() not in body           # тело пустышки не вышло…
+    assert "не взялся".encode() in body           # …но названа в отчёте деградаций
+
+
+def test_article_md_photo_post_survives_junk_gate(monkeypatch, tmp_path):
+    # фото-пост: подпись короткая, но картинка скачалась — это контент
+    monkeypatch.setattr(fz, "html_to_md",
+                        lambda h: h.replace('<img src="img/tiny/p.jpg"/>',
+                                            "![фото](img/tiny/p.jpg)"))
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    monkeypatch.setattr(fz, "rewrite_images",
+                        lambda html, *a, **kw: (html.replace(
+                            '<img src="https://x/p.jpg"/>',
+                            '<img src="img/tiny/p.jpg"/>'), ["p.jpg"], []))
+    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
+                             min_article_chars=None)
+    item = {"title": "@x posted a photo", "link": "https://t.me/x/1", "guid": "g",
+            "date": None, "author": "",
+            "html": "<p>Ну надо пробывать, ящитаю ;)</p><img src=\"https://x/p.jpg\"/>",
+            "feed": fd}
+    cfg = fz.Config(title="Журнал", out=str(tmp_path / "out"),
+                    workdir=str(tmp_path / "wd"))
+    md = fz.article_md(item, cfg, str(tmp_path / "img"),
+                       fz.RunOpts(preset="tiny"))
+    assert md is not None and "фото" in md
+
+
+def test_retry_fulltext_pool(tmp_path, monkeypatch):
+    # неудавшийся полный текст уходит в пул и докатывается в следующий выпуск
+    import datetime as dt
+    st = fz.load_state(str(tmp_path))
+    st["pending"] = {"main": []}
+    calls = {"n": 0}
+
+    def flaky(link, sniff=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise fz.httpx.ConnectError("boom")
+        return "<p>Полный текст вернулся</p>", "Автор"
+
+    monkeypatch.setattr(fz, "fetch_full", flaky)
+    cfg = fz.Config(title="Журнал", out=str(tmp_path / "out"),
+                    workdir=str(tmp_path / "wd"))
+    st["retry_fulltext"]["g1"] = {
+        "kind": None, "guid": "g1", "title": "Докатка", "link": "https://x/1",
+        "date": None, "html": "<p>заглушка</p>", "author": "",
+        "feed": {"name": "X", "full_text": None, "section": None,
+                 "min_article_chars": None},
+        "error": "403", "jid": "main", "tries": 0,
+        "added": "2026-10-01T00:00:00"}
+    # первая докатка: снова упала — попытка списана, статья остаётся в пуле
+    fz._retry_fulltext(cfg, st, dt.datetime(2026, 10, 2))
+    assert st["retry_fulltext"]["g1"]["tries"] == 1
+    assert st["pending"]["main"] == []
+    # вторая: полный текст взялся — уезжает в копилку «Докатнуто · …»
+    fz._retry_fulltext(cfg, st, dt.datetime(2026, 10, 3))
+    assert "g1" not in st["retry_fulltext"]
+    assert [p["guid"] for p in st["pending"]["main"]] == ["g1"]
+    assert "Докатнуто" in st["pending"]["main"][0]["feed"]["section"]
+
+
+def test_issue_reports_degradations(tmp_path, monkeypatch):
+    # лежащий фид и пустая статья попадают в секцию «Что не попало в выпуск»
+    monkeypatch.setattr(fz.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fz, "http_get",
+                        lambda url, **kw: RSS if "x/rss" in url else
+                        (_ for _ in ()).throw(fz.httpx.ConnectError("нет сети")))
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "Живой"\nurl = "https://x/rss"\n'
+        '[[feed]]\nname = "Мёртвый"\nurl = "https://y/rss"\n')
+    cfg = fz._load(str(cfgf))
+    assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True,
+                                         force=True)) == 0
+    st = fz.load_state(str(tmp_path / "wd"))
+    assert "https://y/rss" in st["down_feeds"]
+    assert st["down_feeds"]["https://y/rss"]["name"] == "Мёртвый"
+    epubs = list((tmp_path / "out").glob("*.epub"))
+    assert len(epubs) == 1
+    import zipfile
+    z = zipfile.ZipFile(epubs[0])
+    body = b"".join(z.read(n) for n in z.namelist() if n.endswith(".xhtml"))
+    assert "Что не попало в выпуск".encode() in body
+    assert "не синкался".encode() in body
 
 
 def test_cover_pattern_validation():
@@ -636,7 +749,8 @@ def test_issue_dry_run_no_mutation(tmp_path, monkeypatch):
                                                         text_only=True, dry_run=True)) == 0
     # state не тронут: ни seen, ни счётчик выпусков
     assert fz.load_state(str(tmp_path / "wd")) == {
-        "seen": {}, "issue": {}, "pending": {}, "last_emit": {}}
+        "seen": {}, "issue": {}, "pending": {}, "last_emit": {},
+        "down_feeds": {}, "retry_fulltext": {}}
 
 
 # ---------------------------------------------------------------- периоды
