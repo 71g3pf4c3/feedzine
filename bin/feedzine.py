@@ -934,6 +934,7 @@ class Config(BaseModel):
     classify: ClassifyCfg | None = None    # [classify]: рубрики по содержанию
     llm: LlmCfg | None = None             # [llm]: локальная маленькая LLM
     summarize: bool = False                # «Коротко: …» перед телом статьи
+    dedup_threshold: float = 0.6           # косинус схожести статей; 0 = не сливать
     feed: list[FeedCfg] = Field(default_factory=list)
 
     @field_validator("preset")
@@ -1251,9 +1252,7 @@ def _classify_item(cfg, cent, title, html):
         if hit:
             return hit
     threshold = cfg.classify.threshold
-    # заголовок весит тройным повтором: о теме говорит сильнее тела
-    text = f"{title or ''}. {title or ''}. {title or ''}. {_strip_tags(html)[:600]}"
-    v = _text_vec(text)
+    v = _item_vec(title, html)
     best, score = None, 0.0
     for name, cent_v in cent.items():
         s = _cosine(v, cent_v)
@@ -1265,6 +1264,8 @@ def _classify_item(cfg, cent, title, html):
 # ---------------------------------------------------------------- локальная LLM (llama.cpp)
 
 _LLM_FAIL = {"logged": False}
+_LLM_CACHE = {"data": None, "dirty": False, "path": None}
+_LLM_CACHE_MAX = 4096
 
 
 def _llm_fail(msg):
@@ -1272,6 +1273,28 @@ def _llm_fail(msg):
     if not _LLM_FAIL["logged"]:
         log(f"  ! LLM: {msg} — ухожу на запасной путь (ngram/extractive)")
         _LLM_FAIL["logged"] = True
+
+
+def _llm_cache(cfg):
+    """workdir/llm_cache.json, лениво. Ключ — модель+промпт, поэтому
+    смена модели/шаблона автоматически инвалидирует."""
+    if _LLM_CACHE["data"] is None:
+        p = os.path.join(cfg.workdir, "llm_cache.json")
+        try:
+            _LLM_CACHE["data"] = json.load(open(p)) if os.path.exists(p) else {}
+        except (json.JSONDecodeError, OSError):
+            _LLM_CACHE["data"] = {}
+        _LLM_CACHE["path"] = p
+    return _LLM_CACHE["data"]
+
+
+def llm_cache_save():
+    """Сброс кэша на диск (вызывается в конце прогона, не на каждый чих)."""
+    if _LLM_CACHE["dirty"] and _LLM_CACHE["path"]:
+        os.makedirs(os.path.dirname(_LLM_CACHE["path"]), exist_ok=True)
+        with open(_LLM_CACHE["path"], "w") as f:
+            json.dump(_LLM_CACHE["data"], f, ensure_ascii=False)
+        _LLM_CACHE["dirty"] = False
 
 
 def _llm_prompt(template, system, user):
@@ -1291,8 +1314,10 @@ def _llm_prompt(template, system, user):
 
 
 def llm_complete(cfg, system, user, max_tokens):
-    """Однообёрточный вызов локальной LLM (llama-cli, GGUF).
+    """Однообёрточный вызов локальной LLM (llama-cli, GGUF), с кэшем.
 
+    Ключ — модель+шаблон+промпт: повторные прогоны (preview, сборка
+    после сбоя) не платят CPU-секундами за одно и то же.
     -> текст | None (нет модели/бинария, таймаут, ненулевой rc).
     Best-effort по всей цепочке: вызывающие обязаны уметь без него.
     """
@@ -1304,6 +1329,23 @@ def llm_complete(cfg, system, user, max_tokens):
         _llm_fail("FEEDZINE_LLM не задан и [llm] model пуст")
         return None
     model = os.path.expanduser(model)
+    key = hashlib.sha1(f"{model}|{lc.template}|{max_tokens}|{system}|{user}"
+                       .encode()).hexdigest()
+    cache = _llm_cache(cfg)
+    if key in cache:
+        return cache[key]
+    out = llm_call(cfg, model, system, user, max_tokens)
+    if out is not None:
+        if len(cache) >= _LLM_CACHE_MAX:          # старое вытесняем, не растём
+            cache.pop(next(iter(cache)))
+        cache[key] = out
+        _LLM_CACHE["dirty"] = True
+    return out
+
+
+def llm_call(cfg, model, system, user, max_tokens):
+    """Сам вызов llama-cli (без кэша). -> текст | None."""
+    lc = cfg.llm
     if not os.path.exists(model):
         _llm_fail(f"модель не найдена: {model}")
         return None
@@ -1661,6 +1703,35 @@ def _journal_cfg(cfg, jid):
     return title, outdir, period, keep
 
 
+def _item_vec(title, html):
+    """Вектор статьи для похожести/классификации: заголовок весит
+    тройным повтором — о теме он говорит сильнее тела."""
+    return _text_vec(f"{title}. {title}. {title}. "
+                     f"{_strip_tags(html)[:600]}")
+
+
+def _dedup_similar(articles, threshold):
+    """Слияние похожих статей одного журнала: одна новость с opennet,
+    phoronx и тг-канала — одна статья в выпуске, а не три.
+
+    Похожесть — косинус бинарных n-грамм (тот же вектор, что у
+    классификатора). Оставляем раннюю (репосты приходят позже
+    оригинала), поздние выбрасываем.
+    -> (статьи без дублей, сколько слито)
+    """
+    kept, vecs, merged = [], [], 0
+    if threshold <= 0:
+        return articles, 0
+    for it in articles:                    # уже отсортированы по дате
+        v = _item_vec(it["title"], it["html"])
+        if any(_cosine(v, kv) >= threshold for kv in vecs):
+            merged += 1
+            continue
+        vecs.append(v)
+        kept.append(it)
+    return kept, merged
+
+
 def _emit_journal(cfg, opts, st, jid, imgdir, now):
     """Один журнал: граница периода, сборка, пост-шаги.
 
@@ -1679,6 +1750,10 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
 
     date_str = now.strftime("%Y-%m-%d")
     articles = _pending_prepare(pending)
+    if cfg.dedup_threshold > 0:
+        articles, merged = _dedup_similar(articles, cfg.dedup_threshold)
+        if merged:
+            log(f"{title}: слито похожих статей из разных фидов: {merged}")
 
     # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается;
     # деградации (полный текст не взялся, картинки 403) собираются
@@ -1875,6 +1950,7 @@ def run_issue(cfg, opts):
         except Exception as e:  # noqa: BLE001
             log(f"! журнал {jid}: сборка упала ({e}) — статьи сохранены в накопителе")
             rc = 1
+    llm_cache_save()
     save_state(cfg.workdir, st)
     return rc
 
@@ -1986,6 +2062,7 @@ def run_backfill(cfg, opts, weeks):
         rest = [p for p in pend if p.get("guid") not in emitted]
         if rest:
             st["pending"][jid] = rest
+    llm_cache_save()
     save_state(cfg.workdir, st)
     return rc
 

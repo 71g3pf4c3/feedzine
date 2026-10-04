@@ -696,7 +696,71 @@ def test_llm_prompt_templates():
 def test_llm_complete_no_model(tmp_path):
     # модели нет на диске — None, без исключений
     cfg = _llm_cfg(tmp_path)
+    monkey = None
+    fz._LLM_CACHE["data"] = None          # кэш от прошлых тестов не протекает
     assert fz.llm_complete(cfg, "s", "u", 8) is None
+
+
+def test_llm_cache(tmp_path, monkeypatch):
+    monkeypatch.setitem(fz._LLM_CACHE, "data", None)
+    monkeypatch.setitem(fz._LLM_CACHE, "dirty", False)
+    calls = {"n": 0}
+
+    def fake_call(cfg, model, system, user, max_tokens):
+        calls["n"] += 1
+        return f"ответ {calls['n']}"
+
+    monkeypatch.setattr(fz, "llm_call", fake_call)
+    cfg = _llm_cfg(tmp_path, classify=True)
+    a = fz.llm_complete(cfg, "система", "промпт", 8)
+    b = fz.llm_complete(cfg, "система", "промпт", 8)
+    assert calls["n"] == 1 and a == b == "ответ 1"
+    fz.llm_complete(cfg, "система", "другой промпт", 8)
+    assert calls["n"] == 2
+    # сброс на диск и холодная перезагрузка — hit без вызова
+    fz.llm_cache_save()
+    assert (tmp_path / "wd" / "llm_cache.json").exists()
+    monkeypatch.setitem(fz._LLM_CACHE, "data", None)
+    assert fz.llm_complete(cfg, "система", "промпт", 8) == "ответ 1"
+    assert calls["n"] == 2
+
+
+def test_dedup_similar_merges():
+    a = {"title": "Ubuntu 26.10 beta released with Linux 7.3",
+         "html": "<p>Canonical выпустила бета Ubuntu 26.10: ядро Linux 7.3</p>"}
+    b = {"title": "Ubuntu 26.10 beta released with Linux 7.3 kernel",
+         "html": "<p>Вышла бета Ubuntu 26.10, внутри ядро Linux 7.3</p>"}
+    c = {"title": "KDE Plasma 6.8: tiled windows",
+         "html": "<p>совсем другая новость про кеды</p>"}
+    kept, merged = fz._dedup_similar([a, b, c], 0.6)
+    assert merged == 1
+    assert [k["title"] for k in kept] == [a["title"], c["title"]]
+
+
+def test_dedup_similar_off():
+    items = [{"title": "x", "html": "<p>y</p>"}] * 3
+    kept, merged = fz._dedup_similar(items, 0)
+    assert merged == 0 and len(kept) == 3
+
+
+def test_issue_dedup_cross_feed(tmp_path, monkeypatch):
+    # одна новость с двух фидов (разные guid/link) — в выпуске одна
+    rss2 = RSS.replace("habr.com", "example.com")
+    monkeypatch.setattr(fz, "http_get",
+                        lambda url, **kw: RSS if "a/rss" in url else rss2)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "A"\nurl = "https://a/rss"\n'
+        '[[feed]]\nname = "B"\nurl = "https://b/rss"\n')
+    assert fz.run_issue(fz._load(str(cfgf)), fz.RunOpts(preset="tiny",
+                                                        text_only=True,
+                                                        force=True)) == 0
+    z = zipfile.ZipFile(next((tmp_path / "out").glob("*.epub")))
+    body = "".join(z.read(n).decode() for n in z.namelist()
+                   if n.startswith("EPUB/text/ch"))
+    assert body.count("<h3>Статья два</h3>") == 1   # не два раза из двух фидов
 
 
 def test_article_md_summarize_note(monkeypatch, tmp_path):
