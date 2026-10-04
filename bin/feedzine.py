@@ -28,11 +28,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import xml.etree.ElementTree as ET
 import zlib
 import zipfile
+from collections import deque
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -42,7 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from rich.console import Console
 from rich.table import Table
 from textual.app import App, ComposeResult
-from textual.widgets import DataTable, Footer, Header
+from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
 try:
     from PIL import Image
@@ -57,8 +59,13 @@ DEFAULT_CONFIG = "~/.config/feedzine/config.toml"
 console = Console(highlight=False)
 
 
+# хвост логов для webui/статуса сборки: log() пишет всегда
+LOG_RING = deque(maxlen=400)
+
+
 def log(s):
     # markup=False: имена фидов с [скобками] не должны парситься как разметка
+    LOG_RING.append(s)
     console.print(s, markup=False)
 
 
@@ -1383,6 +1390,8 @@ class FeedzineApp(App):
         ("plus", "max_up", "+1"),
         ("minus", "max_down", "−1"),
         ("i", "build", "выпуск"),
+        ("I", "build_force", "форс-сводка"),
+        ("d", "dryrun", "dry-run"),
         ("r", "refresh", "обновить"),
         ("q", "quit", "выйти"),
     ]
@@ -1397,18 +1406,22 @@ class FeedzineApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static("", id="jbar")
         yield DataTable()
+        yield RichLog(id="rlog", wrap=True, max_lines=500)
         yield Footer()
 
     def on_mount(self):
         t = self.query_one(DataTable)
         t.cursor_type = "row"
-        self.col_keys = t.add_columns("✓", "фид", "новых", "max", "full_text")
+        self.col_keys = t.add_columns("✓", "фид", "новых", "max", "full_text", "журнал")
         for fd in self.cfg.feed:
             self.rows.append({"include": True, "max": fd.max, "ft": fd.full_text})
             self.row_keys.append(t.add_row(
                 "✓", fd.name or fd.url, "…",
-                str(fd.max or self.cfg.max_per_feed), _ft_label(fd.full_text)))
+                str(fd.max or self.cfg.max_per_feed), _ft_label(fd.full_text),
+                fd.journal or "main"))
+        self._render_jbar()
         self._refresh_worker()
 
     # -- данные (в worker-тредах) --
@@ -1421,25 +1434,28 @@ class FeedzineApp(App):
         stats = feed_stats(self.cfg, st["seen"])
         self.call_from_thread(self._render_stats, stats)
 
-    def _build(self):
+    def _effective_cfg(self):
+        """Конфиг с ephemeral-правками таблицы и только отмеченными фидами."""
         cfg2 = self.cfg.model_copy(deep=True)
         for i, fd in enumerate(cfg2.feed):
             r = self.rows[i]
             fd.max = r["max"]
             fd.full_text = r["ft"]
         cfg2.feed = [fd for i, fd in enumerate(cfg2.feed) if self.rows[i]["include"]]
-        if not cfg2.feed:
-            self.call_from_thread(self.notify, "ничего не отмечено")
-            return
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                # TUI: «i» = собрать сводку немедленно из накопленного
-                rc = run_issue(cfg2, replace(self.opts, force=True))
-        except Exception as e:  # noqa: BLE001
-            self.call_from_thread(self.notify, f"сборка упала: {e}", severity="error")
-            return
-        self.call_from_thread(self._after_build, rc, buf.getvalue())
+        return cfg2
+
+    def _run_in_thread(self, opts2):
+        """run_issue в фоне; вывод — в RichLog, итог — в notify."""
+        def work():
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = run_issue(self._effective_cfg(), opts2)
+            except Exception as e:  # noqa: BLE001
+                self.call_from_thread(self.notify, f"сборка упала: {e}", severity="error")
+                return
+            self.call_from_thread(self._after_run, rc, buf.getvalue())
+        self.run_worker(work, thread=True, exclusive=True)
 
     # -- UI (в основном потоке) --
 
@@ -1449,10 +1465,25 @@ class FeedzineApp(App):
             t.update_cell(self.row_keys[i], self.col_keys[2],
                           "недоступен" if s.error else str(s.new))
 
-    def _after_build(self, rc, out):
+    def _render_jbar(self):
+        """Статус журналов: номер выпуска, копилка, период."""
+        st = load_state(self.cfg.workdir)
+        parts = []
+        for jid in _journal_ids(self.cfg, st):
+            title, _out, period, _keep = _journal_cfg(self.cfg, jid)
+            parts.append(f"{title}: №{st['issue'].get(jid, 0)} · "
+                         f"копилка {len(st['pending'].get(jid, []))} · {period}")
+        self.query_one("#jbar", Static).update("  │  ".join(parts) or "нет журналов")
+
+    def _after_run(self, rc, out):
+        rlog = self.query_one("#rlog", RichLog)
+        for line in out.splitlines():
+            if line.strip():
+                rlog.write(line)
         lines = [l for l in out.splitlines() if l.strip()]
         msg = lines[-1] if lines else ("готово" if rc == 0 else "не собралось")
         self.notify(msg, severity="information" if rc == 0 else "warning")
+        self._render_jbar()
         self._refresh_worker()
 
     def _sel(self):
@@ -1467,6 +1498,26 @@ class FeedzineApp(App):
         t.update_cell(self.row_keys[i], self.col_keys[4], _ft_label(r["ft"]))
 
     # -- действия --
+
+    def action_build(self):
+        # «i» — обычный прогон: периоды журналов уважаются (недельная
+        # сводка не соберётся раньше границы), «I» — форс из копилки
+        if not self._effective_cfg().feed:
+            self.notify("ничего не отмечено")
+            return
+        self._run_in_thread(replace(self.opts, force=False))
+
+    def action_build_force(self):
+        if not self._effective_cfg().feed:
+            self.notify("ничего не отмечено")
+            return
+        self._run_in_thread(replace(self.opts, force=True))
+
+    def action_dryrun(self):
+        if not self._effective_cfg().feed:
+            self.notify("ничего не отмечено")
+            return
+        self._run_in_thread(replace(self.opts, dry_run=True))
 
     def action_toggle(self):
         i = self._sel()
@@ -1502,8 +1553,246 @@ class FeedzineApp(App):
     def action_refresh(self):
         self._refresh_worker()
 
-    def action_build(self):
-        self.run_worker(self._build, thread=True, exclusive=True)
+
+# ---------------------------------------------------------------- webui
+
+WEB_PAGE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>feedzine</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,sans-serif;background:#14161a;color:#d7dae0;padding:24px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:#7d8590;font-size:13px;margin-bottom:20px}
+h2{font-size:15px;color:#9fb3c8;margin:18px 0 8px;text-transform:uppercase;letter-spacing:.08em}
+.cards{display:flex;flex-wrap:wrap;gap:12px}
+.card{background:#1d2026;border:1px solid #2a2e36;border-radius:10px;padding:12px 16px;min-width:200px}
+.card .t{font-weight:600}
+.card .m{color:#7d8590;font-size:13px;margin-top:4px}
+.card .big{font-size:26px;font-weight:700;margin:2px 0}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #23262d}
+th{color:#7d8590;font-weight:500}
+tr:hover td{background:#1a1d22}
+button{background:#2c5f8a;border:none;color:#fff;border-radius:8px;padding:9px 16px;
+font-size:14px;cursor:pointer;margin-right:8px}
+button.sec{background:#2a2e36}
+button:disabled{opacity:.45;cursor:default}
+label{font-size:14px;color:#9fb3c8;margin-right:16px}
+#log{background:#0e1013;border:1px solid #23262d;border-radius:10px;padding:12px;
+font:12px/1.55 ui-monospace,monospace;white-space:pre-wrap;max-height:340px;overflow-y:auto;color:#a8b3bf}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.ok{background:#3fb26a}.run{background:#d9a53f}.err{background:#d05c5c}
+.row{display:flex;align-items:center;gap:8px;margin:14px 0}
+</style></head><body>
+<h1>feedzine</h1>
+<div class="sub" id="sub">…</div>
+
+<h2>Журналы</h2>
+<div class="cards" id="journals"></div>
+
+<h2>Фиды</h2>
+<div class="row">
+<button id="scan">проверить фиды</button>
+<button id="build">собрать выпуск</button>
+<label><input type="checkbox" id="force"> форс-сводка</label>
+</div>
+<table id="feeds"><thead>
+<tr><th>фид</th><th>журнал</th><th>в фиде</th><th>новых</th></tr>
+</thead><tbody></tbody></table>
+
+<h2>Лог</h2>
+<div id="log"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+let busy=false;
+async function api(path,opts){const r=await fetch(path,opts);return r.json()}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+async function overview(){
+  const d=await api('/api/overview');
+  $('sub').textContent=d.title+' · '+d.out+' · период '+d.period;
+  $('journals').innerHTML=d.journals.map(j=>`
+    <div class="card"><div class="t">${esc(j.title)}</div>
+    <div class="big">№${j.issue}</div>
+    <div class="m">копилка: ${j.pending} · ${j.period} · ${j.last_emit?('вышел '+j.last_emit):'ещё не выходил'}</div>
+    </div>`).join('')||'<div class="card"><div class="m">журналов нет</div></div>';
+  const rows=d.feeds.map(f=>{
+    const s=(d.scan&&d.scan.rows[f.name])||null;
+    return `<tr><td>${esc(f.name)}</td><td>${esc(f.journal)}</td>
+    <td>${s?s.total:'—'}</td><td>${s?(s.error?'<span class="dot err"></span>ошибка':s.new):'—'}</td></tr>`;
+  });
+  $('feeds').querySelector('tbody').innerHTML=rows.join('');
+  if(d.scan)$('scan').textContent='фиды от '+d.scan.ts.slice(11,16);
+}
+
+async function build_status(){
+  const d=await api('/api/build');
+  const dot=d.running?'<span class="dot run"></span>собирается…'
+    :(d.rc===null?'':'<span class="dot '+(d.rc?'err':'ok')+'"></span>rc='+d.rc);
+  $('build').disabled=d.running;
+  $('build').textContent=d.running?'собирается…':'собрать выпуск';
+  $('log').textContent=d.log.join('\\n')||'— пусто —';
+  if(dot)$('sub').dataset.build=dot;
+  $('log').scrollTop=$('log').scrollHeight;
+}
+
+$('build').onclick=async()=>{
+  const body=JSON.stringify({force:$('force').checked});
+  await fetch('/api/build',{method:'POST',body});
+  build_status();
+};
+$('scan').onclick=async()=>{$('scan').disabled=true;$('scan').textContent='проверяю…';
+  await fetch('/api/scan',{method:'POST'});setTimeout(overview,1000)};
+setInterval(overview,5000);setInterval(build_status,2000);
+overview();build_status();
+</script></body></html>"""
+
+
+def _web_overview(cfg, scan_cache):
+    """JSON-снимок для webui: журналы, фиды, свежие выпуски."""
+    st = load_state(cfg.workdir)
+    journals = []
+    for jid in _journal_ids(cfg, st):
+        title, outdir, period, _keep = _journal_cfg(cfg, jid)
+        journals.append({"id": jid, "title": title, "period": period,
+                         "issue": st["issue"].get(jid, 0),
+                         "pending": len(st["pending"].get(jid, [])),
+                         "last_emit": st["last_emit"].get(jid)})
+    feeds = [{"name": fd.name or fd.url, "url": fd.url,
+              "journal": fd.journal or "main"} for fd in cfg.feed]
+    issues = []
+    exts = ("epub", "html", "md")
+    for jid in _journal_ids(cfg, st):
+        _t, outdir, _p, _k = _journal_cfg(cfg, jid)
+        if os.path.isdir(outdir):
+            for f in os.listdir(outdir):
+                if f.endswith(exts):
+                    p = os.path.join(outdir, f)
+                    issues.append({"file": f, "path": p,
+                                   "mtime": os.path.getmtime(p),
+                                   "size": os.path.getsize(p)})
+    issues.sort(key=lambda i: i["mtime"], reverse=True)
+    out = {"title": cfg.title, "out": cfg.out, "period": cfg.period,
+           "journals": journals, "feeds": feeds, "issues": issues[:15]}
+    if scan_cache:
+        out["scan"] = scan_cache
+    return out
+
+
+def make_web_server(cfg, opts, host, port):
+    """HTTP-сервер webui (без serve_forever) — для запуска и тестов."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state = {"lock": threading.Lock(),
+             "build": {"running": False, "rc": None, "log": []},
+             "scan": None}
+
+    def do_build(force):
+        def work():
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = run_issue(cfg, replace(opts, force=force))
+            except Exception as e:  # noqa: BLE001
+                buf.write(f"! сборка упала: {e}\n")
+                rc = 1
+            with state["lock"]:
+                state["build"] = {"running": False, "rc": rc,
+                                  "log": buf.getvalue().splitlines()[-200:]}
+        with state["lock"]:
+            if state["build"]["running"]:
+                return False
+            state["build"] = {"running": True, "rc": None, "log": ["стартую…"]}
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def do_scan():
+        def work():
+            st = load_state(cfg.workdir)
+            rows = {}
+            for s in feed_stats(cfg, st["seen"]):
+                rows[s.name] = {"total": s.total, "new": s.new, "error": s.error}
+            with state["lock"]:
+                state["scan"] = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                                 "rows": rows}
+        with state["lock"]:
+            if state.get("scan_running"):
+                return False
+            state["scan_running"] = True
+        def run_and_clear():
+            try:
+                work()
+            finally:
+                with state["lock"]:
+                    state["scan_running"] = False
+        threading.Thread(target=run_and_clear, daemon=True).start()
+        return True
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            b = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            if self.path == "/":
+                self._send(200, WEB_PAGE, "text/html; charset=utf-8")
+            elif self.path == "/api/overview":
+                with state["lock"]:
+                    scan = dict(state["scan"], rows=dict(state["scan"]["rows"])) if state["scan"] else None
+                self._send(200, json.dumps(_web_overview(cfg, scan), ensure_ascii=False))
+            elif self.path == "/api/build":
+                with state["lock"]:
+                    self._send(200, json.dumps(state["build"], ensure_ascii=False))
+            else:
+                self._send(404, '{"error": "not found"}')
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if self.path == "/api/build":
+                ok = do_build(bool(body.get("force")))
+                self._send(200 if ok else 409,
+                           json.dumps({"started": ok}, ensure_ascii=False))
+            elif self.path == "/api/scan":
+                do_scan()
+                self._send(200, '{"started": true}')
+            else:
+                self._send(404, '{"error": "not found"}')
+
+        def log_message(self, fmt, *args):  # шум в консоль не нужен
+            pass
+
+    return ThreadingHTTPServer((host, port), H)
+
+
+def run_web(cfg, opts, host, port, browser=True):
+    """Локальный webui: stdlib http.server, без новых депов.
+
+    Только просмотр и запуск сборки — конфиг web не правит (он может быть
+    менеджеримым home-manager'ом). Сборка — в фоне, single-flight; лог
+    тянется опросом /api/build. По умолчанию слушаем 127.0.0.1 — наружу
+    не выставляй без понимания, что это без авторизации.
+    """
+    srv = make_web_server(cfg, opts, host, port)
+    url = f"http://{host}:{srv.server_address[1]}/"
+    log(f"webui: {url}")
+    if browser:
+        import webbrowser
+        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
 
 
 # ---------------------------------------------------------------- CLI (typer)
@@ -1641,6 +1930,19 @@ def tui_cmd(config: str = CONFIG_OPT,
         log(f"preset {preset!r} не из {sorted(PRESETS)}")
         raise typer.Exit(2)
     FeedzineApp(_load(config), RunOpts(preset=preset)).run()
+
+
+@app.command("web")
+def web_cmd(config: str = CONFIG_OPT,
+            preset: str = typer.Option("reader", help="пресет картинок"),
+            host: str = typer.Option("127.0.0.1", help="адрес; 0.0.0.0 — слушать все интерфейсы"),
+            port: int = typer.Option(8097, help="порт"),
+            no_browser: bool = typer.Option(False, "--no-browser", help="не открывать браузер")):
+    """webui: журналы, фиды, сборка выпуска из браузера"""
+    if preset not in PRESETS:
+        log(f"preset {preset!r} не из {sorted(PRESETS)}")
+        raise typer.Exit(2)
+    run_web(_load(config), RunOpts(preset=preset), host, port, browser=not no_browser)
 
 
 def main():

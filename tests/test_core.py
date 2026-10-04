@@ -789,7 +789,142 @@ def test_journal_validation():
         fz.Config.model_validate({"journal": {"hn": {"period": "год"}}})
 
 
+# ---------------------------------------------------------------- webui
+
+def test_webui_endpoints(tmp_path, monkeypatch):
+    import threading
+    import urllib.request
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Веб"\nperiod = "week"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n'
+        '[[feed]]\nname = "HN"\nurl = "https://hn/rss"\njournal = "hn"\n')
+    cfg = fz._load(cfgf)
+
+    runs = []
+    ev = threading.Event()
+
+    def fake_run(cfg2, opts2):
+        runs.append(opts2.force)
+        print(f"сборка force={opts2.force}")
+        ev.set()
+        return 0
+    monkeypatch.setattr(fz, "run_issue", fake_run)
+
+    srv = fz.make_web_server(cfg, fz.RunOpts(preset="tiny"), "127.0.0.1", 0)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        html = urllib.request.urlopen(base + "/").read().decode()
+        assert html.startswith("<!doctype") and "feedzine" in html
+        assert "журналы" in html.lower() or "journal" in html
+        ov = json.loads(urllib.request.urlopen(base + "/api/overview").read())
+        js = {j["id"]: j for j in ov["journals"]}
+        assert set(js) == {"main", "hn"}
+        assert js["hn"]["period"] == "week" and js["hn"]["pending"] == 0
+        assert ov["feeds"][1]["journal"] == "hn"
+
+        req = urllib.request.Request(base + "/api/build",
+                                     data=b'{"force": true}', method="POST")
+        assert json.loads(urllib.request.urlopen(req).read()) == {"started": True}
+        assert ev.wait(5)
+        assert runs == [True]
+        ev.clear()
+        st = json.loads(urllib.request.urlopen(base + "/api/build").read())
+        assert st["rc"] == 0 and any("force=True" in l for l in st["log"])
+
+        req = urllib.request.Request(base + "/api/build",
+                                     data=b'{}', method="POST")
+        assert json.loads(urllib.request.urlopen(req).read()) == {"started": True}
+        assert ev.wait(5)
+        assert runs == [True, False]
+        urllib.request.urlopen(base + "/api/nope")
+        assert False
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_webui_build_single_flight(tmp_path, monkeypatch):
+    import threading
+    import urllib.request
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        f'title = "W"\nout = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    cfg = fz._load(cfgf)
+
+    started, release = threading.Event(), threading.Event()
+
+    def slow_run(cfg2, opts2):
+        started.set()
+        release.wait(5)
+        return 0
+    monkeypatch.setattr(fz, "run_issue", slow_run)
+    srv = fz.make_web_server(cfg, fz.RunOpts(preset="tiny"), "127.0.0.1", 0)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        r1 = urllib.request.Request(base + "/api/build", data=b"{}", method="POST")
+        assert json.loads(urllib.request.urlopen(r1).read())["started"] is True
+        assert started.wait(5)
+        # пока сборка идёт — вторая не стартует (409)
+        r2 = urllib.request.Request(base + "/api/build", data=b"{}", method="POST")
+        try:
+            urllib.request.urlopen(r2)
+            assert False, "ожидали 409"
+        except urllib.error.HTTPError as e:
+            assert e.code == 409
+    finally:
+        release.set()
+        srv.shutdown()
+        srv.server_close()
+
+
 # ---------------------------------------------------------------- TUI (textual)
+
+def test_tui_build_respects_period_and_force(tmp_path, monkeypatch):
+    import asyncio
+
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\njournal = "hn"\n')
+    cfg = fz._load(str(cfgf))
+    monkeypatch.setattr(fz, "feed_stats", lambda cfg, seen: [])
+    forces = []
+
+    def fake_run(cfg2, opts2):
+        forces.append(opts2.force)
+        assert cfg2.feed[0].journal == "hn"
+        return 0
+    monkeypatch.setattr(fz, "run_issue", fake_run)
+    app = fz.FeedzineApp(cfg, fz.RunOpts(preset="tiny"))
+
+    async def run():
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("i")            # обычный выпуск: период уважается
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("I")            # форс-сводка из копилки
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.press("d")            # dry-run тем же путём
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert forces == [False, True, False]
+
+    asyncio.run(run())
+
 
 def test_tui_toggle_and_cycle(tmp_path, monkeypatch):
     import asyncio
