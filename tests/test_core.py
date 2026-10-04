@@ -4,6 +4,7 @@ import datetime
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +25,7 @@ RSS = """<?xml version="1.0" encoding="utf-8"?>
   <link>https://habr.com/ru/articles/1090040/</link>
   <guid>https://habr.com/ru/articles/1090040/</guid>
   <pubDate>Sun, 04 Oct 2026 11:17:52 GMT</pubDate>
-  <description>&lt;p&gt;Сводка&lt;/p&gt;</description>
+  <description>&lt;p&gt;Сводка: &lt;?статья до""" + " текст " * 60 + """&lt;/?&gt;&lt;/p&gt;</description>
   <dc:creator>vasya</dc:creator>
 </item>
 <item>
@@ -32,7 +33,7 @@ RSS = """<?xml version="1.0" encoding="utf-8"?>
   <link>https://habr.com/ru/articles/1089999/?utm=x</link>
   <guid>https://habr.com/ru/articles/1089999/</guid>
   <pubDate>Sat, 03 Oct 2026 09:00:00 GMT</pubDate>
-  <description>&lt;p&gt;Ещё&lt;/p&gt;</description>
+  <description>&lt;p&gt;Ещё: """ + "проза " * 60 + """&lt;/p&gt;</description>
   <dc:creator>petya</dc:creator>
 </item>
 </channel></rss>"""
@@ -270,6 +271,93 @@ def test_make_cover_drops_uncovered_glyphs(tmp_path):
     im = Image.open(dst)
     assert im.mode == "L" and im.size == (600, 800)
     assert sum(1 for v in im.getdata() if v < 128) > 500
+
+
+# ---------------------------------------------------------------- фильтр пустого
+
+def test_md_prose_len():
+    # картинки, ссылки, код и разметка прозой не считаются
+    md = ("![alt](img/p/x.jpg) [читать](https://x) **жирный** `code`\n"
+          "```python\nprint('hi')\n```\n## заголовок\nОбычная проза тут.")
+    assert fz._md_prose_len(md) == len("читать жирный code заголовок Обычная проза тут.")
+    assert fz._md_prose_len("[читать](https://x)") == len("читать")
+    assert fz._md_prose_len("![x](y.jpg)") == 0
+
+
+def _mk_item(html, link="https://ex.com/a", ft=None):
+    from types import SimpleNamespace
+    return {"title": "T", "link": link, "guid": "g1", "date": None,
+            "html": html, "author": "",
+            "feed": SimpleNamespace(name="X", full_text=ft, section=None,
+                                     min_article_chars=None)}
+
+
+def test_article_md_drops_link_only_stub(monkeypatch, tmp_path):
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)          # без pandoc
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    cfg = fz.Config.model_validate({"feed": [{"url": "https://x"}]})
+    # голая ссылка без контента — не статья
+    assert fz.article_md(_mk_item('<a href="https://ex.com/a">читай</a>'),
+                         cfg, str(tmp_path), fz.RunOpts()) is None
+    # осмысленная сводка проходит
+    ok = fz.article_md(_mk_item("<p>" + "нормальный текст статьи. " * 20 + "</p>"),
+                       cfg, str(tmp_path), fz.RunOpts())
+    assert ok and "нормальный" in ok
+
+
+def test_article_md_min_chars_override(monkeypatch, tmp_path):
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    short = _mk_item("<p>коротко: было да.</p>")
+    # глобально 0 — короткое живёт
+    cfg = fz.Config.model_validate({"feed": [{"url": "https://x"}],
+                                          "min_article_chars": 0})
+    assert fz.article_md(short, cfg, str(tmp_path), fz.RunOpts()) is not None
+    # override на фиде — едет в item["feed"], а не ищется в cfg
+    short["feed"].min_article_chars = 0
+    cfg2 = fz.Config.model_validate({"feed": [{"url": "https://x"}]})
+    assert fz.article_md(short, cfg2, str(tmp_path), fz.RunOpts()) is not None
+
+
+def test_auto_full_text_for_link_feeds(monkeypatch, tmp_path):
+    # auto + огрызок вместо сводки -> сниффер вызывается сам (без habr-ссылки)
+    calls = []
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)
+    monkeypatch.setattr(fz, "fetch_full",
+                        lambda link, sniff=None: calls.append(link) or ("<p>" + "статья " * 300 + "</p>", None))
+    cfg = fz.Config.model_validate({"feed": [{"url": "https://x"}]})
+    ok = fz.article_md(_mk_item("<p>ссылка</p>", link="https://ex.com/post"),
+                       cfg, str(tmp_path), fz.RunOpts())
+    assert calls == ["https://ex.com/post"]
+    assert "статья" in ok
+    # богатая сводка (>= 300 символов текста) — сайт не дёргаем
+    calls.clear()
+    fz.article_md(_mk_item("<p>" + "богатая сводка. " * 80 + "</p>",
+                           link="https://ex.com/rich"), cfg, str(tmp_path), fz.RunOpts())
+    assert calls == []
+
+
+def test_issue_skips_junk_articles(tmp_path, monkeypatch):
+    # первая статья становится голой ссылкой, вторая остаётся нормальной
+    junk_rss = re.sub(r"<description>.*?</description>",
+                      "<description>&lt;a href='https://x/1'&gt;читай&lt;/a&gt;</description>",
+                      RSS, count=1)
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: junk_rss)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    cfg = fz._load(str(cfgf))
+    assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True,
+                                        force=True)) == 0
+    epubs = list((tmp_path / "out").glob("*.epub"))
+    assert len(epubs) == 1
+    import zipfile
+    z = zipfile.ZipFile(epubs[0])
+    body = b"".join(z.read(n) for n in z.namelist() if n.endswith(".xhtml"))
+    assert "Статья два".encode() in body          # нормальная прошла
+    assert "Статья один".encode() not in body     # пустая выкинута
 
 
 def test_cover_pattern_validation():
@@ -624,7 +712,7 @@ RSS2 = """<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0"><channel><title>HN</title>
 <item><title>HN статья</title><link>https://hn/1</link><guid>hn-1</guid>
 <pubDate>Thu, 01 Oct 2026 10:00:00 +0000</pubDate>
-<description>сводка</description></item>
+<description>""" + "статья целиком " * 40 + """</description></item>
 </channel></rss>"""
 
 

@@ -792,6 +792,7 @@ class FeedCfg(BaseModel):
     include_tags: list[str] | None = None
     exclude_tags: list[str] | None = None
     journal: str | None = None      # id отдельного журнала (out/<id>/)
+    min_article_chars: int | None = None  # None — глобальный; 0 — не фильтровать
 
 
 class JournalCfg(BaseModel):
@@ -816,6 +817,7 @@ class Config(BaseModel):
     full_text: str | bool = "auto"
     max_per_feed: int = 10
     text_only: bool = False
+    min_article_chars: int = 120   # меньше прозы (без ссылок/картинок) — не статья
     include_tags: list[str] = Field(default_factory=list)
     exclude_tags: list[str] = Field(default_factory=list)
     cover: str = "auto"              # auto | image | generated | off
@@ -842,6 +844,13 @@ class Config(BaseModel):
     def _check_cover(cls, v):
         if v not in ("auto", "image", "generated", "off"):
             raise ValueError("cover должен быть auto | image | generated | off")
+        return v
+
+    @field_validator("min_article_chars")
+    @classmethod
+    def _check_min_chars(cls, v):
+        if v < 0:
+            raise ValueError("min_article_chars должен быть >= 0 (0 = не фильтровать)")
         return v
 
     @field_validator("cover_pattern")
@@ -986,12 +995,39 @@ def demote_headings(md):
     return "\n".join(out)
 
 
+def _item_text_len(html):
+    """Объём текста в html-фрагменте: без тегов, сущностей и пробелов."""
+    t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html or "", flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return len(htmllib.unescape(t).strip())
+
+
+def _md_prose_len(md):
+    """Объём «прозы» в markdown: картинки/ссылки/разметка не считаются.
+
+    Это гейт пустого говна: статья-ссылка без контента даёт ~0.
+    """
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", md)        # картинки не текст
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)        # ссылки -> их текст
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)          # код не проза
+    t = re.sub(r"[#*_>`~|\[\]-]+", " ", t)                # разметка
+    return len(" ".join(t.split()))
+
+
 def article_md(item, cfg, imgdir, opts):
-    """Статья -> markdown: шапка с метаданными + сводка/полный текст."""
+    """Статья -> markdown: шапка с метаданными + сводка/полный текст.
+
+    None — пустое говно: после зачистки ссылок/картинок в теле меньше
+    min_article_chars прозы (голая ссылка, заглушка paywall, пустая
+    сводка). Вызывавший должен такую статью из выпуска выкинуть.
+    """
     fd = item["feed"]
     ft = fd.full_text if fd.full_text is not None else cfg.full_text
-    # auto: полный текст только там, где умеем надёжно (Habr); true/always: пробуем везде
-    want_full = ft in (True, "always") or (ft == "auto" and habr_id(item["link"]))
+    # auto: Habr (надёжный kek/v2) и «огрызки» — фиды-агрегаторы (HN,
+    # rss-bridge), у которых сводка — это ссылка, а не текст
+    stub = _item_text_len(item["html"]) < 300
+    want_full = (ft in (True, "always")
+                 or (ft == "auto" and (habr_id(item["link"]) or stub)))
     html, author = item["html"], item["author"]
     if want_full and item["link"]:
         try:
@@ -1010,9 +1046,14 @@ def article_md(item, cfg, imgdir, opts):
                                  base=base, q=cfg.img_quality or None)
     else:
         html = re.sub(r"<img\b[^>]*>", "", html)
-    body = html_to_md(html) or "_(пустая сводка)_"
+    body = html_to_md(html) or ""
     # внутренние заголовки статьи демо́тимся (fenced-коды не трогаем)
     body = demote_headings(body)
+    min_chars = (fd.min_article_chars if fd.min_article_chars is not None
+                 else cfg.min_article_chars)
+    if _md_prose_len(body) < min_chars:
+        log(f"  − пустое не пошло в выпуск: {item['title'][:60]}")
+        return None
     d = item["date"].strftime("%d.%m.%Y") if item["date"] else ""
     src = fd.name or "RSS"
     head = f"*{author or src}"
@@ -1112,7 +1153,8 @@ def _pending_add(pending, fresh):
     """
     for it in fresh:
         fd = it.pop("feed")
-        it["feed"] = {"name": fd.name, "full_text": fd.full_text, "section": fd.section}
+        it["feed"] = {"name": fd.name, "full_text": fd.full_text, "section": fd.section,
+                      "min_article_chars": fd.min_article_chars}
         it["date"] = it["date"].isoformat() if it["date"] else None
         pending.append(it)
 
@@ -1126,7 +1168,8 @@ def _pending_prepare(pending):
         it2 = dict(it)
         it2["feed"] = SimpleNamespace(section=it["feed"].get("section"),
                                       name=it["feed"].get("name"),
-                                      full_text=it["feed"].get("full_text"))
+                                      full_text=it["feed"].get("full_text"),
+                                      min_article_chars=it["feed"].get("min_article_chars"))
         it2["date"] = (datetime.datetime.fromisoformat(it["date"])
                        if it["date"] else None)
         out.append(it2)
@@ -1177,25 +1220,32 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
         return True
 
     date_str = now.strftime("%Y-%m-%d")
+    articles = _pending_prepare(pending)
+
+    # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается
+    parts, first_img = {}, None
+    with console.status(f"{title}: {len(articles)} статей"):
+        for it in articles:
+            m = article_md(it, cfg, imgdir, opts)
+            if m is None:
+                continue
+            parts.setdefault(_section(it["feed"]), []).append(m + "\n")
+            if first_img is None and not opts.text_only:
+                m2 = re.search(r"!\[[^\]]*\]\(img/[^/]+/([^)]+)\)", m)
+                if m2:
+                    first_img = f"{imgdir}/{m2.group(1)}"
+    if not parts:
+        log(f"{title}: всё отсеялось пустым — выпуск не собираю")
+        pending.clear()
+        st["last_emit"][jid] = date_str
+        return True
+
     st["issue"][jid] = st["issue"].get(jid, 0) + 1
     n = st["issue"][jid]
-    articles = _pending_prepare(pending)
-    by_feed = {}
-    for it in articles:
-        by_feed.setdefault(_section(it["feed"]), []).append(it)
-
     md = [f"# {title} №{n}\n\n*{now.strftime('%d %B %Y')}*\n"]
-    first_img = None
-    with console.status(f"{title} №{n}: {len(articles)} статей"):
-        for fname, items in by_feed.items():
-            md.append(f"\n## {fname}\n")
-            for it in items:
-                m = article_md(it, cfg, imgdir, opts)
-                md.append(m + "\n")
-                if first_img is None and not opts.text_only:
-                    m2 = re.search(r"!\[[^\]]*\]\(img/[^/]+/([^)]+)\)", m)
-                    if m2:
-                        first_img = f"{imgdir}/{m2.group(1)}"
+    for fname, blocks in parts.items():
+        md.append(f"\n## {fname}\n")
+        md.extend(blocks)
     md_file = f"{cfg.workdir}/issue_{jid}_{n}.md"
     with open(md_file, "w") as f:
         f.write("\n".join(md))
@@ -1204,7 +1254,7 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
 
     def gen_cover():
         return make_cover(f"{cfg.workdir}/cover_{jid}_{n}.png", title, n, date_str,
-                          list(by_feed), size=PRESETS[opts.preset].get("cover"),
+                          list(parts), size=PRESETS[opts.preset].get("cover"),
                           pattern=cfg.cover_pattern)
 
     cover = None
@@ -1464,6 +1514,7 @@ out = "~/Books/feedzine"          # куда класть выпуски
 preset = "reader"                # reader | eink | mini | tiny | hq
 full_text = "auto"               # auto: полный текст для Habr, сводки для остальных
 max_per_feed = 10                # статей на фид в выпуске
+min_article_chars = 120           # меньше прозы (без ссылок/картинок) — не статья; 0 = не фильтровать
 include_tags = []                # теги статьи из фида: ["python", "go"]; [] = без фильтра
 exclude_tags = []                # напр. ["из песочницы", "перевод"]
 cover = "auto"                   # auto: первая картинка выпуска, нет её — сгенерированный узор
