@@ -20,6 +20,17 @@ _spec = importlib.util.spec_from_file_location(
 fz = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fz)
 
+
+@pytest.fixture(autouse=True)
+def _llm_state_isolated():
+    # LLM-глобалы между тестами не протекают: кэш с чужим путём,
+    # dirty-флаг и «уже жаловались» — общие для всего модуля
+    fz._LLM_CACHE.update(data=None, dirty=False, path=None)
+    fz._LLM_FAIL["logged"] = False
+    yield
+    fz._LLM_CACHE.update(data=None, dirty=False, path=None)
+    fz._LLM_FAIL["logged"] = False
+
 RSS = """<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
 <channel><title>Хабр · тест</title>
@@ -779,14 +790,10 @@ def test_llm_prompt_templates():
 def test_llm_complete_no_model(tmp_path):
     # модели нет на диске — None, без исключений
     cfg = _llm_cfg(tmp_path)
-    monkey = None
-    fz._LLM_CACHE["data"] = None          # кэш от прошлых тестов не протекает
     assert fz.llm_complete(cfg, "s", "u", 8) is None
 
 
 def test_llm_cache(tmp_path, monkeypatch):
-    monkeypatch.setitem(fz._LLM_CACHE, "data", None)
-    monkeypatch.setitem(fz._LLM_CACHE, "dirty", False)
     calls = {"n": 0}
 
     def fake_call(cfg, model, system, user, max_tokens):
