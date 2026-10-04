@@ -34,7 +34,7 @@ import tomllib
 import xml.etree.ElementTree as ET
 import zlib
 import zipfile
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from urllib.parse import urljoin
@@ -858,6 +858,7 @@ class FeedCfg(BaseModel):
     exclude_tags: list[str] | None = None
     journal: str | None = None      # id отдельного журнала (out/<id>/)
     min_article_chars: int | None = None  # None — глобальный; 0 — не фильтровать
+    summarize: bool | None = None   # None — глобальный summarize
 
 
 class JournalCfg(BaseModel):
@@ -871,6 +872,39 @@ class JournalCfg(BaseModel):
     period: str = ""            # пусто — глобальный period
     keep_issues: int = 0        # 0 = глобальный keep_issues
     authors: bool = False       # автор в заголовке статьи («Автор · Тема»)
+
+
+class SectionCfg(BaseModel):
+    """[classify.section.<Имя>] — целевая рубрика классификатора."""
+    model_config = ConfigDict(extra="forbid")
+    seeds: list[str] = Field(default_factory=list)   # ключи/фразы рубрики
+
+
+class ClassifyCfg(BaseModel):
+    """[classify] — авто-рубрики: статья уходит в рубрику по содержанию,
+    а не по тому, из какого фида приехала."""
+    model_config = ConfigDict(extra="forbid")
+    engine: str = "ngram"        # ngram | off (off — всюду секция фида)
+    threshold: float = 0.25       # косинус ниже — остаётся в секции фида
+    journals: list[str] = Field(default_factory=list)  # пусто — все журналы
+    section: dict[str, SectionCfg] = Field(default_factory=dict)
+
+
+class LlmCfg(BaseModel):
+    """[llm] — локальная маленькая LLM через llama.cpp (GGUF).
+
+    Классификация/выжимка качественнее ngram, но медленнее: на CPU
+    считайте секунды на статью. Промах (нет модели/бинария/таймаут)
+    молча уходит на запасной путь — сборка не ломается.
+    """
+    model_config = ConfigDict(extra="forbid")
+    model: str = ""              # путь к .gguf; пусто — env FEEDZINE_LLM
+    binary: str = "llama-cli"    # бинарий llama.cpp из PATH
+    template: str = "chatml"    # chatml | llama3 | gemma | raw
+    ctx: int = 2048              # контекст (промпт + ответ)
+    timeout: int = 180           # сек на вызов
+    classify: bool = False       # рубрики через LLM
+    summarize: bool = False       # выжимка «Коротко:» через LLM
     keep_issues: int = 0        # 0 — глобальный keep_issues
 
 
@@ -897,6 +931,9 @@ class Config(BaseModel):
     calibre_library: str = ""        # непусто — добавлять выпуск через calibredb
     post_issue: str = ""             # shell-хук после сборки, %f = путь к выпуску
     journal: dict[str, JournalCfg] = Field(default_factory=dict)
+    classify: ClassifyCfg | None = None    # [classify]: рубрики по содержанию
+    llm: LlmCfg | None = None             # [llm]: локальная маленькая LLM
+    summarize: bool = False                # «Коротко: …» перед телом статьи
     feed: list[FeedCfg] = Field(default_factory=list)
 
     @field_validator("preset")
@@ -1130,6 +1167,239 @@ def _md_img_count(md):
     return len(re.findall(r"!\[[^\]]*\]\(img/[^)]+\)", md))
 
 
+# ---------------------------------------------------------------- классификатор + суммарайзер
+
+STOPWORDS = frozenset("""
+и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по
+только ее мне было вот от меня еще нет о из ему теперь когда даже ну вдруг ли
+если уже или ни быть был него до вас нибудь опять уж вам сказал ведь там потом
+себя ничего ей может они тут где есть надо ней для мы тебя их чем была сам чтоб
+без будто человек чего раз тоже себе под жизнь будет ж тогда кто этот говорил
+того потому этого какой совсем ним здесь этом один почти мой тем чтобы нее
+кажется сейчас были куда зачем сказать всех никогда сегодня можно при наконец
+два об другой хоть после над больше тот через эти нас про всего них какая
+много разве три эту моя впрочем хорошо своей этой перед иногда лучше чуть том
+нельзя такой им более всегда конечно всю между
+the a an and or of to in on for with is are was be this that it as at by from
+""".split())
+
+
+def _strip_tags(html):
+    """HTML-фрагмент -> чистый текст (для классификации/выжимки)."""
+    t = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html or "",
+               flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return htmllib.unescape(t)
+
+
+def _text_vec(text):
+    """Бинарные символьные 3-4-граммы нормализованного текста -> вектор.
+
+    Не частоты, а присутствие: repeated слова («проза проза проза…»)
+    не топят редкие тематические граммы. Морфологию русского так не
+    разрулить, но суффиксы/корни попадают в n-граммы — для «о чём
+    статья» хватает с головой.
+    """
+    t = re.sub(r"[\W_]+", " ", (text or "").lower()).strip()
+    v = Counter()
+    for n in (3, 4):
+        for i in range(len(t) - n + 1):
+            v[t[i:i + n]] = 1
+    return v
+
+
+def _cosine(a, b):
+    """Косинус двух Counter-векторов."""
+    if not a or not b:
+        return 0.0
+    small, big = (a, b) if len(a) < len(b) else (b, a)
+    dot = sum(w * big.get(k, 0) for k, w in small.items())
+    na = math.sqrt(sum(w * w for w in a.values()))
+    nb = math.sqrt(sum(w * w for w in b.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _classify_prepare(cfg):
+    """Центроиды рубрик из сидов. None — классификация выключена."""
+    cc = cfg.classify
+    if not cc or cc.engine == "off" or not cc.section:
+        return None
+    centroids = {}
+    for name, sc in cc.section.items():
+        vecs = [_text_vec(s) for s in sc.seeds if s.strip()]
+        if not vecs:
+            continue
+        cent = Counter()
+        for v in vecs:
+            for k, w in v.items():
+                cent[k] += w
+        for k in cent:
+            cent[k] /= len(vecs)
+        centroids[name] = cent
+    return centroids or None
+
+
+def _classify_item(cfg, cent, title, html):
+    """Лучшая рубрика статьи: (имя, score) | None (ниже порога — секция фида).
+
+    Классифицируем заголовок + начало текста: хвост статьи про тему
+    говорит слабее, чем название и первый абзац. LLM-режим ([llm]
+    classify = true) решает первым, его промах уходит на ngram.
+    """
+    if cfg.llm and cfg.llm.classify:
+        hit = _llm_classify(cfg, cent, title, html)
+        if hit:
+            return hit
+    threshold = cfg.classify.threshold
+    # заголовок весит тройным повтором: о теме говорит сильнее тела
+    text = f"{title or ''}. {title or ''}. {title or ''}. {_strip_tags(html)[:600]}"
+    v = _text_vec(text)
+    best, score = None, 0.0
+    for name, cent_v in cent.items():
+        s = _cosine(v, cent_v)
+        if s > score:
+            best, score = name, s
+    return (best, score) if best and score >= threshold else None
+
+
+# ---------------------------------------------------------------- локальная LLM (llama.cpp)
+
+_LLM_FAIL = {"logged": False}
+
+
+def _llm_fail(msg):
+    """Одна жалоба на прогон: 60 статей = 60 одинаковых ошибок не нужны."""
+    if not _LLM_FAIL["logged"]:
+        log(f"  ! LLM: {msg} — ухожу на запасной путь (ngram/extractive)")
+        _LLM_FAIL["logged"] = True
+
+
+def _llm_prompt(template, system, user):
+    """Собрать промпт под чат-шаблон модели (спец-токены распарсит -e)."""
+    if template == "llama3":
+        return (f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+                f"{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+                f"{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
+    if template == "gemma":
+        return (f"<start_of_turn>user\n{system}\n\n{user}<end_of_turn>\n"
+                f"<start_of_turn>model\n")
+    if template == "raw":
+        return f"{system}\n\n{user}"
+    # chatml по умолчанию (Qwen, Yi, многие другие)
+    return (f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+
+
+def llm_complete(cfg, system, user, max_tokens):
+    """Однообёрточный вызов локальной LLM (llama-cli, GGUF).
+
+    -> текст | None (нет модели/бинария, таймаут, ненулевой rc).
+    Best-effort по всей цепочке: вызывающие обязаны уметь без него.
+    """
+    lc = cfg.llm
+    if not lc:
+        return None
+    model = os.environ.get("FEEDZINE_LLM") or lc.model
+    if not model:
+        _llm_fail("FEEDZINE_LLM не задан и [llm] model пуст")
+        return None
+    model = os.path.expanduser(model)
+    if not os.path.exists(model):
+        _llm_fail(f"модель не найдена: {model}")
+        return None
+    exe = shutil.which(lc.binary)
+    if not exe:
+        _llm_fail(f"{lc.binary} не в PATH (нужен llama.cpp)")
+        return None
+    cmd = [exe, "-m", model, "-p", _llm_prompt(lc.template, system, user),
+           "-n", str(max_tokens), "-c", str(lc.ctx), "--temp", "0",
+           "-e", "-no-cnv", "--no-display-prompt", "--log-disable"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=lc.timeout)
+    except subprocess.TimeoutExpired:
+        _llm_fail(f"таймаут {lc.timeout}с")
+        return None
+    if r.returncode != 0:
+        _llm_fail(f"llama-cli rc={r.returncode}: {(r.stderr or '')[:120]}")
+        return None
+    return (r.stdout or "").strip() or None
+
+
+def _llm_classify(cfg, cent, title, html):
+    """Рубрика от LLM: строго имя из списка или «НЕТ».
+
+    Ответ валидируем по списку рубрик: маленькая модель может
+    фантазировать — на фантазию отвечаем None (ngram решит сам).
+    """
+    names = sorted(cent)
+    seeds = "\n".join(f"- {n}: {', '.join(cfg.classify.section[n].seeds[:8])}"
+                      for n in names)
+    text = " ".join(_strip_tags(html)[:400].split())
+    out = llm_complete(
+        cfg,
+        "Ты — классификатор статей e-журнала. Ответь ровно одним именем "
+        "рубрики из списка, без кавычек и пояснений. Если ничего не "
+        "подходит — ровно одно слово: НЕТ.",
+        f"Рубрики:\n{seeds}\n\nЗаголовок: {title}\n"
+        f"Текст: {text}\n\nРубрика:", 8)
+    if not out:
+        return None
+    s = out.strip().strip("\"'.").splitlines()[0].strip()
+    for n in names:
+        if s.casefold() == n.casefold():
+            return n, 1.0
+    return None
+
+
+def _llm_summarize(cfg, html, title=""):
+    """Выжимка от LLM: 1–2 предложения, по-русски, без кавычек. '' — мимо."""
+    out = llm_complete(
+        cfg,
+        "Ты — редактор e-журнала для e-ink читалки. Сожми текст в 1–2 "
+        "предложения по-русски: только суть, без вступлений и кавычек.",
+        f"{title}\n\n{_strip_tags(html)[:2000]}", 96)
+    if not out:
+        return ""
+    return " ".join(out.split())[:400]
+
+
+def _sentences(text):
+    """Разбивка на предложения (кавычки/аббревиатуры — best effort)."""
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    return [p.strip() for p in re.split(r"(?<=[.!?…])\s+", t)
+            if len(p.strip()) > 20]
+
+
+def summarize(text, k=2):
+    """Extractive-выжимка: k самых весомых предложений в исходном порядке.
+
+    Вес слова — его частота без стоп-слов; вес предложения — сумма весов,
+    нормированная на корень длины (короткие не выигрывают за счёт
+    одной частой фразы), первому абзацу бонус. Пусто — текста мало.
+    """
+    sents = _sentences(text)
+    if len(sents) <= k:
+        return ""
+    freq = Counter()
+    for w in re.findall(r"[а-яёa-z0-9]+", (text or "").lower()):
+        if w not in STOPWORDS and len(w) > 2:
+            freq[w] += 1
+    if not freq:
+        return ""
+    scored = []
+    for i, s in enumerate(sents):
+        words = [w for w in re.findall(r"[а-яёa-z0-9]+", s.lower())
+                 if w not in STOPWORDS and len(w) > 2]
+        if not words:
+            continue
+        score = sum(freq[w] for w in words) / len(words) ** 0.7
+        scored.append((score * (1.1 if i == 0 else 1.0), i, s))
+    scored.sort(reverse=True)
+    top = sorted((i, s) for _s, i, s in scored[:k])
+    return " ".join(s for _i, s in top)
+
+
 def article_md(item, cfg, imgdir, opts, failures=None):
     """Статья -> markdown: шапка с метаданными + сводка/полный текст.
 
@@ -1169,7 +1439,8 @@ def article_md(item, cfg, imgdir, opts, failures=None):
                              "html": item["html"], "author": item["author"],
                              "feed": {"name": fd.name, "full_text": fd.full_text,
                                       "section": fd.section,
-                                      "min_article_chars": fd.min_article_chars},
+                                      "min_article_chars": fd.min_article_chars,
+                                      "summarize": getattr(fd, "summarize", None)},
                              "error": ft_err})
     img_fails = []
     if not opts.text_only:
@@ -1217,7 +1488,20 @@ def article_md(item, cfg, imgdir, opts, failures=None):
     jc = cfg.journal.get(getattr(fd, "journal", None) or "main")
     if jc and jc.authors and author:
         title = f"{author} · {title}"
-    return f"### {title}\n\n{head}{note}\n\n{body}\n"
+    # extractive-выжимка (summarize): «Коротко: …» перед телом;
+    # при [llm] summarize = true — абстрактивная от локальной LLM,
+    # её промах уходит на extractive
+    do_sum = getattr(fd, "summarize", None)
+    do_sum = cfg.summarize if do_sum is None else do_sum
+    brief = ""
+    if do_sum:
+        b = _llm_summarize(cfg, html, item["title"]) \
+            if cfg.llm and cfg.llm.summarize else ""
+        if not b:
+            b = summarize(_strip_tags(html))
+        if b:
+            brief = f"\n\n> **Коротко:** {b}"
+    return f"### {title}\n\n{head}{note}{brief}\n\n{body}\n"
 
 
 def _errcode_list(fails):
@@ -1323,7 +1607,8 @@ def _pending_add(pending, fresh):
             continue
         fd = it.pop("feed")
         it["feed"] = {"name": fd.name, "full_text": fd.full_text, "section": fd.section,
-                      "min_article_chars": fd.min_article_chars}
+                      "min_article_chars": fd.min_article_chars,
+                      "summarize": getattr(fd, "summarize", None)}
         it["date"] = it["date"].isoformat() if it["date"] else None
         pending.append(it)
         have.add(it["guid"])
@@ -1341,7 +1626,8 @@ def _pending_prepare(pending):
         it2["feed"] = SimpleNamespace(section=it["feed"].get("section"),
                                       name=it["feed"].get("name"),
                                       full_text=it["feed"].get("full_text"),
-                                      min_article_chars=it["feed"].get("min_article_chars"))
+                                      min_article_chars=it["feed"].get("min_article_chars"),
+                                      summarize=it["feed"].get("summarize"))
         it2["date"] = (datetime.datetime.fromisoformat(it["date"])
                        if it["date"] else None)
         out.append(it2)
@@ -1397,16 +1683,29 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
     # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается;
     # деградации (полный текст не взялся, картинки 403) собираются
     parts, first_img, failures = {}, None, []
+    # рубрики по содержанию: центроиды сидов, ниже порога — секция фида
+    cent = _classify_prepare(cfg)
+    classy = (cent and (not cfg.classify.journals
+                         or jid in cfg.classify.journals))
+    moved = 0
     with console.status(f"{title}: {len(articles)} статей"):
         for it in articles:
             m = article_md(it, cfg, imgdir, opts, failures=failures)
             if m is None:
                 continue
-            parts.setdefault(_section(it["feed"]), []).append(m + "\n")
+            sec = _section(it["feed"])
+            if classy:
+                hit = _classify_item(cfg, cent, it["title"], it["html"])
+                if hit and hit[0] != sec:
+                    sec, moved = hit[0], moved + 1
+            parts.setdefault(sec, []).append(m + "\n")
             if first_img is None and not opts.text_only:
                 m2 = re.search(r"!\[[^\]]*\]\(img/[^/]+/([^)]+)\)", m)
                 if m2:
                     first_img = f"{imgdir}/{m2.group(1)}"
+    if classy:
+        log(f"  классификатор: {moved} из {len(articles)} статей "
+            f"переехали из секции фида")
     if not parts:
         log(f"{title}: всё отсеялось пустым — выпуск не собираю")
         pending.clear()
@@ -1717,6 +2016,69 @@ def feed_stats(cfg, seen):
             r.error = str(e)
         rows.append(r)
     return rows
+
+
+def analyze_state(cfg):
+    """Сводка по state.json без сети: накопители, деградации, темп.
+
+    Для `feedzine analyze` и WebUI. Ничего не фетчит и не мутирует.
+    """
+    st = load_state(cfg.workdir)
+    today = datetime.date.today()
+    last7 = 0
+    for d in st.get("seen", {}).values():
+        try:
+            if 0 <= (today - datetime.date.fromisoformat(d)).days <= 6:
+                last7 += 1
+        except ValueError:
+            continue
+    journals = []
+    for jid in _journal_ids(cfg, st):
+        title, _o, period, _k = _journal_cfg(cfg, jid)
+        pend = st["pending"].get(jid, [])
+        journals.append({
+            "journal": jid, "title": title,
+            "period": period or cfg.period,
+            "issues": st["issue"].get(jid, 0),
+            "pending": len(pend),
+            "oldest_pending": min((p.get("date") for p in pend
+                                  if p.get("date")), default=None),
+            "last_emit": st["last_emit"].get(jid),
+            "top_feeds": Counter((p["feed"].get("name") or "?") for p in pend
+                                 ).most_common(3),
+        })
+    return {
+        "journals": journals,
+        "down_feeds": st.get("down_feeds", {}),
+        "retry_fulltext": len(st.get("retry_fulltext") or {}),
+        "seen_total": len(st.get("seen") or {}),
+        "seen_last7": last7,
+    }
+
+
+def classify_preview(cfg):
+    """Как классификатор разложил бы ТЕКУЩИЕ статьи фидов (сеть, read-only).
+
+    -> (rows: {рубрика: [заголовки]}, below: [заголовки ниже порога])
+    """
+    cent = _classify_prepare(cfg)
+    if not cent:
+        return None, None
+    rows, below = {}, []
+    for fd in cfg.feed:
+        try:
+            _ft, items = parse_feed(http_get(fd.url))
+        except Exception as e:  # noqa: BLE001
+            log(f"  ! фид {fd.name or fd.url} не прочитался: {e}")
+            continue
+        for it in items:
+            hit = _classify_item(cfg, cent, it["title"], it["html"])
+            if hit:
+                rows.setdefault(hit[0], []).append(
+                    f"{it['title'][:60]} · {hit[1]:.2f}")
+            else:
+                below.append(it["title"][:60])
+    return rows, below
 
 
 # ---------------------------------------------------------------- TUI (textual)
@@ -2288,6 +2650,67 @@ def backfill_cmd(config: str = CONFIG_OPT,
                                                          text_only=text_only,
                                                          dry_run=dry_run,
                                                          format=format), weeks))
+
+
+@app.command("analyze")
+def analyze_cmd(config: str = CONFIG_OPT,
+                json_out: bool = typer.Option(False, "--json",
+                                              help="машиночитаемо, без таблиц")):
+    """анализ состояния: накопители, деградации, темп (без сети)"""
+    a = analyze_state(_load(config))
+    if json_out:
+        print(json.dumps(a, ensure_ascii=False, indent=1, default=str))
+        raise typer.Exit(0)
+    t = Table(title="Журналы")
+    t.add_column("журнал")
+    t.add_column("выпусков", justify="right")
+    t.add_column("в накопителе", justify="right")
+    t.add_column("старейшая", justify="right")
+    t.add_column("последний выпуск", justify="right")
+    t.add_column("топ-фиды накопителя")
+    for j in a["journals"]:
+        t.add_row(j["journal"], str(j["issues"]), str(j["pending"]),
+                  j["oldest_pending"] or "—", j["last_emit"] or "—",
+                  ", ".join(f"{n} ({c})" for n, c in j["top_feeds"]) or "—")
+    console.print(t)
+    console.print(f"прочитано всего: {a['seen_total']}, за 7 дней: {a['seen_last7']}")
+    if a["retry_fulltext"]:
+        console.print(f"в пуле ретраев полного текста: {a['retry_fulltext']}")
+    if a["down_feeds"]:
+        t = Table(title="Лежащие фиды")
+        t.add_column("фид")
+        t.add_column("ошибка")
+        t.add_column("с")
+        for d in a["down_feeds"].values():
+            t.add_row(d.get("name", "?"), d.get("error", "?"),
+                      d.get("since", "?"))
+        console.print(t)
+
+
+@app.command("classify")
+def classify_cmd(config: str = CONFIG_OPT,
+                 limit: int = typer.Option(3, "--limit", min=0,
+                                           help="примеров заголовков на рубрику")):
+    """как классификатор разложил бы текущие статьи фидов (сеть, preview)"""
+    cfg = _load(config)
+    with console.status("читаю фиды…"):
+        rows, below = classify_preview(cfg)
+    if rows is None:
+        log("классификатор выключен: нет [classify.section.*] с сидами "
+            "(или engine = off)")
+        raise typer.Exit(2)
+    t = Table(title="Рубрики по содержанию (порог "
+           f"{cfg.classify.threshold}, ниже — секция фида)")
+    t.add_column("рубрика")
+    t.add_column("статей", justify="right")
+    t.add_column("примеры (score)")
+    for name in sorted(rows, key=lambda n: -len(rows[n])):
+        titles = rows[name]
+        t.add_row(name, str(len(titles)),
+                  "\n".join(titles[:limit]) if limit else "")
+    console.print(t)
+    if below:
+        console.print(f"ниже порога (останутся в секции фида): {len(below)}")
 
 
 @app.command("tui")

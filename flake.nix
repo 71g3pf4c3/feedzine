@@ -33,7 +33,7 @@
         ];
         feedzine = pkgs.stdenv.mkDerivation rec {
           pname = "feedzine";
-          version = "0.15.0";
+          version = "0.16.0";
 
           src = self;
 
@@ -50,6 +50,7 @@
               --add-flags "$out/share/feedzine/feedzine.py" \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.pandoc
+                pkgs.llama-cpp          # [llm]: llama-cli для локальной LLM
               ]}
 
             runHook postInstall

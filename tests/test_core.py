@@ -4,6 +4,8 @@ import datetime
 import importlib.util
 import json
 import os
+import zipfile
+
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -519,6 +521,232 @@ def test_collect_bridge_error_mixed(tmp_path, monkeypatch):
                                            fz.RunOpts(preset="tiny"))
     assert len(fresh) == 1 and fresh[0]["title"] == "Статья два"
     assert "https://x/rss" not in st["down_feeds"]
+
+
+# ------------------------------------------------------- классификатор + выжимка
+
+def _classify_cfg(tmp_path, **section_seeds):
+    return fz.Config(
+        title="Журнал", out=str(tmp_path / "out"), workdir=str(tmp_path / "wd"),
+        classify=fz.ClassifyCfg(
+            section={name: fz.SectionCfg(seeds=seeds)
+                    for name, seeds in section_seeds.items()}))
+
+
+def test_classify_ngram_routes_by_content(tmp_path):
+    cfg = _classify_cfg(tmp_path,
+                        Железо=["fpga", "raspberry pi", "микроконтроллер stm32"],
+                        Софт=["python", "типизация", "рефакторинг кода"])
+    cent = fz._classify_prepare(cfg)
+    assert cent is not None and set(cent) == {"Железо", "Софт"}
+    hit = fz._classify_item(cfg, cent, "Пишем рефакторинг на python",
+                            "<p>Типизация и тесты, рефакторинг старого кода</p>")
+    assert hit and hit[0] == "Софт"
+    hit = fz._classify_item(cfg, cent, "Микроконтроллер stm32 и fpga",
+                            "<p>печатная плата, raspberry pi, паяем</p>")
+    assert hit and hit[0] == "Железо"
+
+
+def test_classify_threshold_fallback(tmp_path):
+    cfg = _classify_cfg(tmp_path, Железо=["fpga", "raspberry pi"])
+    cfg.classify.threshold = 0.25
+    cent = fz._classify_prepare(cfg)
+    # нерелевантный текст ниже порога — секция фида
+    assert fz._classify_item(cfg, cent, "Рецепт борща со свёклой",
+                             "<p>готовим суп, капуста, морковь</p>") is None
+
+
+def test_classify_off_and_prepare_none(tmp_path):
+    cfg = fz.Config(title="Ж", out=str(tmp_path), workdir=str(tmp_path))
+    assert fz._classify_prepare(cfg) is None          # classify нет вообще
+    cfg2 = _classify_cfg(tmp_path, Железо=[])
+    assert fz._classify_prepare(cfg2) is None         # рубрика без сидов
+    cfg3 = _classify_cfg(tmp_path, Железо=["fpga"])
+    cfg3.classify.engine = "off"
+    assert fz._classify_prepare(cfg3) is None
+
+
+def test_issue_classifies_sections(tmp_path, monkeypatch):
+    # выпуск: статьи раскладываются по рубрикам содержания, не по фидам
+    py_rss = RSS.replace("Ещё:", "python gil ещё:")
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: py_rss)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[classify]\nthreshold = 0.05\n'
+        '[classify.section."Питон"]\nseeds = ["python", "gil"]\n'
+        '[[feed]]\nname = "Фид"\nurl = "https://x/rss"\n')
+    assert fz.run_issue(fz._load(str(cfgf)), fz.RunOpts(preset="tiny",
+                                                        text_only=True,
+                                                        force=True)) == 0
+    z = zipfile.ZipFile(next((tmp_path / "out").glob("*.epub")))
+    nav = z.read("EPUB/nav.xhtml").decode()
+    assert "Питон" in nav                        # рубрика вместо секции фида
+
+
+def test_summarize_extractive():
+    text = ("Сначала предложение про python и типизацию, важное для теста. "
+            "Потом про то, что код на python надо покрывать тестами. "
+            "Затем совсем про другое: борщ, капуста и морковь на плите. "
+            "И ещё немного слов про суп и овощи без смысла.")
+    out = fz.summarize(text, k=1)
+    assert "python" in out and "борщ" not in out
+
+
+def test_summarize_short_text_empty():
+    assert fz.summarize("Одно короткое предложение.", k=2) == ""
+
+
+# ---------------------------------------------------------------- LLM-движок
+
+def _llm_cfg(tmp_path, classify=False, summarize=False):
+    return fz.Config(
+        title="Журнал", out=str(tmp_path / "out"), workdir=str(tmp_path / "wd"),
+        llm=fz.LlmCfg(model="/fake/model.gguf", classify=classify,
+                      summarize=summarize))
+
+
+def test_llm_classify_routes(tmp_path, monkeypatch):
+    # LLM отвечает именем рубрики — оно и едет, даже если ngram не прав
+    cfg = _llm_cfg(tmp_path, classify=True)
+    cfg.classify = fz.ClassifyCfg(
+        threshold=0.9, section={"Софт": fz.SectionCfg(seeds=["python"])})
+    cent = fz._classify_prepare(cfg)
+    monkeypatch.setattr(fz, "llm_complete",
+                        lambda *a, **kw: "Софт")
+    hit = fz._classify_item(cfg, cent, "Что угодно", "<p>совсем не про то</p>")
+    assert hit == ("Софт", 1.0)
+
+
+def test_llm_classify_fantasy_rejected(tmp_path, monkeypatch):
+    # модель фантазирует чужим именем — игнор, уходим на ngram
+    cfg = _llm_cfg(tmp_path, classify=True)
+    cfg.classify = fz.ClassifyCfg(
+        threshold=0.05, section={"Софт": fz.SectionCfg(seeds=["python"])})
+    cent = fz._classify_prepare(cfg)
+    monkeypatch.setattr(fz, "llm_complete", lambda *a, **kw: "Кулинария")
+    hit = fz._classify_item(cfg, cent, "Про python и типизацию",
+                            "<p>python код, тесты, типизация</p>")
+    assert hit and hit[0] == "Софт" and hit[1] < 1.0
+
+
+def test_llm_classify_failure_falls_back(tmp_path, monkeypatch):
+    # llm недоступен (None) — решает ngram
+    cfg = _llm_cfg(tmp_path, classify=True)
+    cfg.classify = fz.ClassifyCfg(
+        threshold=0.05, section={"Софт": fz.SectionCfg(seeds=["python"])})
+    cent = fz._classify_prepare(cfg)
+    monkeypatch.setattr(fz, "llm_complete", lambda *a, **kw: None)
+    hit = fz._classify_item(cfg, cent, "Про python", "<p>python код и тесты</p>")
+    assert hit and hit[0] == "Софт"
+
+
+def test_llm_summarize_used_in_article(monkeypatch, tmp_path):
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    monkeypatch.setattr(fz, "llm_complete",
+                        lambda *a, **kw: "Суть: python отпустили GIL.")
+    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
+                             min_article_chars=None, journal=None,
+                             summarize=True)
+    long_text = " ".join(f"Предложение {i} про python и типизацию." for i in range(6))
+    item = {"title": "Т", "link": "https://x/1", "guid": "g",
+            "date": None, "author": "", "html": f"<p>{long_text}</p>",
+            "feed": fd}
+    cfg = _llm_cfg(tmp_path, summarize=True)
+    md = fz.article_md(item, cfg, str(tmp_path / "img"),
+                       fz.RunOpts(preset="tiny"))
+    assert "**Коротко:** Суть: python отпустили GIL." in md
+
+
+def test_llm_disabled_by_default(monkeypatch, tmp_path):
+    # без [llm] локальная модель не зовётся вовсе
+    calls = {"n": 0}
+
+    def boom(*a, **kw):
+        calls["n"] += 1
+        return "хуйня"
+
+    monkeypatch.setattr(fz, "llm_complete", boom)
+    cfg = _classify_cfg(tmp_path, Софт=["python"])
+    cfg.summarize = True
+    cent = fz._classify_prepare(cfg)
+    fz._classify_item(cfg, cent, "python статья", "<p>python</p>")
+    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
+                             min_article_chars=None, journal=None,
+                             summarize=True)
+    item = {"title": "Т", "link": "", "guid": "g", "date": None, "author": "",
+            "html": "<p>" + "текст предложения про всякое. " * 6 + "</p>",
+            "feed": fd}
+    fz.article_md(item, cfg, str(tmp_path / "img"), fz.RunOpts(preset="tiny"))
+    assert calls["n"] == 0
+
+
+def test_llm_prompt_templates():
+    p = fz._llm_prompt("chatml", "СИС", "ЮЗЕР")
+    assert "<|im_start|>system\nСИС<|im_end|>" in p
+    p = fz._llm_prompt("llama3", "СИС", "ЮЗЕР")
+    assert "<|start_header_id|>user<|end_header_id|>" in p
+    p = fz._llm_prompt("gemma", "СИС", "ЮЗЕР")
+    assert p.startswith("<start_of_turn>user")
+    assert fz._llm_prompt("raw", "СИС", "ЮЗЕР") == "СИС\n\nЮЗЕР"
+
+
+def test_llm_complete_no_model(tmp_path):
+    # модели нет на диске — None, без исключений
+    cfg = _llm_cfg(tmp_path)
+    assert fz.llm_complete(cfg, "s", "u", 8) is None
+
+
+def test_article_md_summarize_note(monkeypatch, tmp_path):
+    # summarize = true: перед телом «Коротко: …»
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
+                             min_article_chars=None, journal=None,
+                             summarize=True)
+    long_text = (" ".join(f"Предложение номер {i} про python и типизацию."
+                          for i in range(6)) + " Финал про борщ и капусту.")
+    item = {"title": "Т", "link": "https://x/1", "guid": "g",
+            "date": None, "author": "", "html": f"<p>{long_text}</p>",
+            "feed": fd}
+    cfg = fz.Config(title="Журнал", out=str(tmp_path / "out"),
+                    workdir=str(tmp_path / "wd"))
+    md = fz.article_md(item, cfg, str(tmp_path / "img"),
+                       fz.RunOpts(preset="tiny"))
+    assert "**Коротко:**" in md
+    # выключено — нет
+    fd2 = fz.SimpleNamespace(name="X", full_text=False, section=None,
+                              min_article_chars=None, journal=None,
+                              summarize=False)
+    item2 = dict(item, feed=fd2)
+    assert "**Коротко:**" not in fz.article_md(
+        item2, cfg, str(tmp_path / "img"), fz.RunOpts(preset="tiny"))
+
+
+def test_analyze_state(tmp_path):
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    cfg = fz._load(str(cfgf))
+    a = fz.analyze_state(cfg)
+    assert a["journals"][0]["journal"] == "main"
+    assert a["journals"][0]["pending"] == 0 and a["seen_total"] == 0
+    # накопитель и down_feeds считаются
+    os.makedirs(tmp_path / "wd", exist_ok=True)
+    st = fz.load_state(str(tmp_path / "wd"))
+    st["pending"]["main"] = [{"guid": "g", "date": "2026-10-01",
+                              "feed": {"name": "X"}}]
+    st["down_feeds"]["https://y/rss"] = {"name": "Y", "error": "403",
+                                         "since": "2026-10-01", "jid": "main"}
+    fz.save_state(str(tmp_path / "wd"), st)
+    a = fz.analyze_state(cfg)
+    assert a["journals"][0]["pending"] == 1
+    assert a["journals"][0]["oldest_pending"] == "2026-10-01"
+    assert a["down_feeds"]["https://y/rss"]["name"] == "Y"
 
 
 def test_retry_fulltext_pool(tmp_path, monkeypatch):
