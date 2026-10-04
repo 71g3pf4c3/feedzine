@@ -33,7 +33,7 @@
         ];
         feedzine = pkgs.stdenv.mkDerivation rec {
           pname = "feedzine";
-          version = "0.18.0";
+          version = "0.19.0";
 
           src = self;
 

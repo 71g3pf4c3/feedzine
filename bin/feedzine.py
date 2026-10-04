@@ -1241,6 +1241,23 @@ def _classify_prepare(cfg):
     return centroids or None
 
 
+def classify_enabled(cfg, jid):
+    """Центроиды рубрик для журнала — или None, если не активна.
+
+    Не активна: нет сидов/engine = off, либо журнал вырезан
+    classify.journals. Единая точка решения «работает ли рубрикация
+    по содержанию» — выпуск и preview отвечают на него одинаково,
+    preview не должен показывать то, что в выпуск не попадёт.
+    """
+    cent = _classify_prepare(cfg)
+    if not cent:
+        return None
+    cc = cfg.classify
+    if cc.journals and jid not in cc.journals:
+        return None
+    return cent
+
+
 def _classify_item(cfg, cent, title, html):
     """Лучшая рубрика статьи: (имя, score) | None (ниже порога — секция фида).
 
@@ -1274,6 +1291,14 @@ def _llm_fail(msg):
     if not _LLM_FAIL["logged"]:
         log(f"  ! LLM: {msg} — ухожу на запасной путь (ngram/extractive)")
         _LLM_FAIL["logged"] = True
+
+
+def _llm_run_reset():
+    """Сброс «одной жалобы» перед прогоном. webui живёт одним процессом:
+    без сброса вторая сборка с лежащей LLM молчит — деградация обязана
+    сурфейситься каждый прогон, а не раз за жизнь процесса. Кэш не
+    трогаем: жить между прогонами — его работа."""
+    _LLM_FAIL["logged"] = False
 
 
 def _llm_cache(cfg):
@@ -1475,6 +1500,33 @@ def summarize(text, k=2):
     return " ".join(s for _i, s in top)
 
 
+# ------------------------------------------------- снимок фида (форма в state)
+
+FEED_SNAP_KEYS = ("name", "full_text", "section", "min_article_chars",
+                  "summarize", "journal")
+
+
+def feed_snapshot(fd):
+    """Фид (FeedCfg/namespace) -> сериализуемый снимок для state.
+
+    Конфиг фида может измениться (или фид исчезнуть) до выпуска — сводка
+    не должна зависеть от текущего конфига. Снимок — единственная форма,
+    которая живёт в pending/пуле ретраев: новое поле фида добавляется в
+    FEED_SNAP_KEYS один раз, а не правкой в пяти местах.
+    """
+    return {k: getattr(fd, k, None) for k in FEED_SNAP_KEYS}
+
+
+def feed_runtime(snap):
+    """Снимок -> namespace с полным набором полей для article_md/_section.
+
+    Старым записям state без journal/summarize поля дописываются как
+    None: читатели снимка работают с атрибутами напрямую, без getattr.
+    """
+    snap = {k: snap.get(k) for k in FEED_SNAP_KEYS}
+    return SimpleNamespace(**snap)
+
+
 def article_md(item, cfg, imgdir, opts, failures=None):
     """Статья -> markdown: шапка с метаданными + сводка/полный текст.
 
@@ -1512,10 +1564,7 @@ def article_md(item, cfg, imgdir, opts, failures=None):
                              "date": (item["date"].isoformat()
                                       if item["date"] else None),
                              "html": item["html"], "author": item["author"],
-                             "feed": {"name": fd.name, "full_text": fd.full_text,
-                                      "section": fd.section,
-                                      "min_article_chars": fd.min_article_chars,
-                                      "summarize": getattr(fd, "summarize", None)},
+                             "feed": feed_snapshot(fd),
                              "error": ft_err})
     img_fails = []
     if not opts.text_only:
@@ -1560,13 +1609,13 @@ def article_md(item, cfg, imgdir, opts, failures=None):
     # заголовок статьи: для журналов с authors = true — с автором
     # (тг-каналы: у постов нет тем, без автора оглавление — каша из огрызков)
     title = item["title"]
-    jc = cfg.journal.get(getattr(fd, "journal", None) or "main")
+    jc = cfg.journal.get(fd.journal or "main")
     if jc and jc.authors and author:
         title = f"{author} · {title}"
     # extractive-выжимка (summarize): «Коротко: …» перед телом;
     # при [llm] summarize = true — абстрактивная от локальной LLM,
     # её промах уходит на extractive
-    do_sum = getattr(fd, "summarize", None)
+    do_sum = fd.summarize
     do_sum = cfg.summarize if do_sum is None else do_sum
     brief = ""
     if do_sum:
@@ -1681,9 +1730,7 @@ def _pending_add(pending, fresh):
         if it["guid"] in have or (it.get("link") and it["link"] in have):
             continue
         fd = it.pop("feed")
-        it["feed"] = {"name": fd.name, "full_text": fd.full_text, "section": fd.section,
-                      "min_article_chars": fd.min_article_chars,
-                      "summarize": getattr(fd, "summarize", None)}
+        it["feed"] = feed_snapshot(fd)
         it["date"] = it["date"].isoformat() if it["date"] else None
         pending.append(it)
         have.add(it["guid"])
@@ -1698,11 +1745,7 @@ def _pending_prepare(pending):
     out = []
     for it in pending:
         it2 = dict(it)
-        it2["feed"] = SimpleNamespace(section=it["feed"].get("section"),
-                                      name=it["feed"].get("name"),
-                                      full_text=it["feed"].get("full_text"),
-                                      min_article_chars=it["feed"].get("min_article_chars"),
-                                      summarize=it["feed"].get("summarize"))
+        it2["feed"] = feed_runtime(it["feed"])
         it2["date"] = (datetime.datetime.fromisoformat(it["date"])
                        if it["date"] else None)
         out.append(it2)
@@ -1765,6 +1808,37 @@ def _dedup_similar(articles, threshold):
     return kept, merged
 
 
+def journal_layout(cfg, opts, articles, jid, imgdir):
+    """Раскладка статей накопителя по секциям — без state и pandoc.
+
+    Junk-гейт (article_md -> None), рубрикация по содержанию и сбор
+    деградаций (полный текст/картинки) живут здесь; шов для проверки
+    классификации/джанка без полной сборки выпуска.
+    -> (секции {имя: [markdown]}, первая картинка | None, failures)
+    """
+    parts, first_img, failures = {}, None, []
+    cent = classify_enabled(cfg, jid)
+    moved = 0
+    for it in articles:
+        m = article_md(it, cfg, imgdir, opts, failures=failures)
+        if m is None:
+            continue
+        sec = _section(it["feed"])
+        if cent:
+            hit = _classify_item(cfg, cent, it["title"], it["html"])
+            if hit and hit[0] != sec:
+                sec, moved = hit[0], moved + 1
+        parts.setdefault(sec, []).append(m + "\n")
+        if first_img is None and not opts.text_only:
+            m2 = re.search(r"!\[[^\]]*\]\(img/[^/]+/([^)]+)\)", m)
+            if m2:
+                first_img = f"{imgdir}/{m2.group(1)}"
+    if cent:
+        log(f"  классификатор: {moved} из {len(articles)} статей "
+            f"переехали из секции фида")
+    return parts, first_img, failures
+
+
 def _emit_journal(cfg, opts, st, jid, imgdir, now):
     """Один журнал: граница периода, сборка, пост-шаги.
 
@@ -1794,30 +1868,9 @@ def _emit_journal(cfg, opts, st, jid, imgdir, now):
 
     # сборка markdown; пустое говно (голые ссылки/заглушки) отсеивается;
     # деградации (полный текст не взялся, картинки 403) собираются
-    parts, first_img, failures = {}, None, []
-    # рубрики по содержанию: центроиды сидов, ниже порога — секция фида
-    cent = _classify_prepare(cfg)
-    classy = (cent and (not cfg.classify.journals
-                         or jid in cfg.classify.journals))
-    moved = 0
     with console.status(f"{title}: {len(articles)} статей"):
-        for it in articles:
-            m = article_md(it, cfg, imgdir, opts, failures=failures)
-            if m is None:
-                continue
-            sec = _section(it["feed"])
-            if classy:
-                hit = _classify_item(cfg, cent, it["title"], it["html"])
-                if hit and hit[0] != sec:
-                    sec, moved = hit[0], moved + 1
-            parts.setdefault(sec, []).append(m + "\n")
-            if first_img is None and not opts.text_only:
-                m2 = re.search(r"!\[[^\]]*\]\(img/[^/]+/([^)]+)\)", m)
-                if m2:
-                    first_img = f"{imgdir}/{m2.group(1)}"
-    if classy:
-        log(f"  классификатор: {moved} из {len(articles)} статей "
-            f"переехали из секции фида")
+        parts, first_img, failures = journal_layout(cfg, opts, articles,
+                                                     jid, imgdir)
     if not parts:
         log(f"{title}: всё отсеялось пустым — выпуск не собираю")
         pending.clear()
@@ -1898,6 +1951,19 @@ RETRY_MAX_TRIES = 5      # попыток полного текста на ст�
 RETRY_MAX_DAYS = 14      # после — сдаёмся (в тексте уже есть пометка)
 
 
+def _pool_stale(e, now):
+    """Запись пула ретраев протухла: попытки исчерпаны или слишком стара.
+
+    now — date или datetime. Единственное место правила: _retry_fulltext
+    выкидывает, gc чистит, отчёт выпуска печатает «N/M» по тем же
+    константам.
+    """
+    now = now.date() if isinstance(now, datetime.datetime) else now
+    added = datetime.datetime.fromisoformat(e.get("added") or "1970-01-01")
+    return (e.get("tries", 0) >= RETRY_MAX_TRIES
+            or (now - added.date()).days > RETRY_MAX_DAYS)
+
+
 def _retry_fulltext(cfg, st, now):
     """Повторная выгрузка полного текста для провалившихся.
 
@@ -1907,8 +1973,7 @@ def _retry_fulltext(cfg, st, now):
     """
     pool = st.get("retry_fulltext") or {}
     for guid, e in list(pool.items()):
-        added = datetime.datetime.fromisoformat(e.get("added") or "1970-01-01")
-        if e.get("tries", 0) >= RETRY_MAX_TRIES or (now - added).days > RETRY_MAX_DAYS:
+        if _pool_stale(e, now):
             pool.pop(guid)
             continue
         full = None
@@ -1920,13 +1985,13 @@ def _retry_fulltext(cfg, st, now):
             e["tries"] = e.get("tries", 0) + 1
             continue
         pool.pop(guid)
-        fdp = dict(e.get("feed") or {})
-        fdp["section"] = f"Докатнуто · {fdp.get('section') or fdp.get('name') or 'RSS'}"
+        snap = dict(e.get("feed") or {})
+        snap["section"] = f"Докатнуто · {snap.get('section') or snap.get('name') or 'RSS'}"
         item = {"title": e["title"], "link": e["link"], "guid": guid,
                 "date": (datetime.datetime.fromisoformat(e["date"])
                          if e.get("date") else None),
                 "html": full, "author": e.get("author") or "",
-                "tags": [], "feed": SimpleNamespace(**fdp)}
+                "tags": [], "feed": feed_runtime(snap)}
         log(f"  + докатка: полный текст взялся — {e['title'][:60]}")
         _pending_add(st["pending"].setdefault(e.get("jid", "main"), []), [item])
 
@@ -1939,6 +2004,7 @@ def run_issue(cfg, opts):
     seen — общий пул на все журналы. Провал сборки одного журнала не
     трогает остальные; статьи проваленного остаются в накопителе.
     """
+    _llm_run_reset()
     os.makedirs(cfg.workdir, exist_ok=True)
     os.makedirs(cfg.out, exist_ok=True)
     imgdir = f"{cfg.workdir}/img/{opts.preset}"
@@ -2044,6 +2110,7 @@ def run_backfill(cfg, opts, weeks):
     вычищается из накопителей, чтобы regular-поток не выдал двойное;
     накопленное вне окна (без даты/старое) возвращается на место.
     """
+    _llm_run_reset()
     st = load_state(cfg.workdir)
 
     plan, window = backfill_plan(cfg, weeks)
@@ -2196,9 +2263,7 @@ def run_gc(cfg, days=30, seen_days=0):
     pool = st.get("retry_fulltext") or {}
     today = datetime.date.today()
     for guid, e in list(pool.items()):
-        added = datetime.datetime.fromisoformat(e.get("added") or "1970-01-01")
-        if e.get("tries", 0) >= RETRY_MAX_TRIES \
-                or (today - added.date()).days > RETRY_MAX_DAYS:
+        if _pool_stale(e, today):
             pool.pop(guid)
     # seen по желанию: старые guid не выбрасываем автоматически — только явным флагом
     if seen_days > 0:
@@ -2286,13 +2351,17 @@ def run_doctor(cfg, net=False):
 def classify_preview(cfg):
     """Как классификатор разложил бы ТЕКУЩИЕ статьи фидов (сеть, read-only).
 
-    -> (rows: {рубрика: [заголовки]}, below: [заголовки ниже порога])
+    Фиды журналов, вырезанных classify.journals, не смотрятся вовсе —
+    preview показывает ровно то, что уйдёт в выпуск.
+    -> (rows: {рубрика: [заголовки]}, below: [заголовки ниже порога]);
+    (None, None) — классификация не активна ни для одного журнала.
     """
-    cent = _classify_prepare(cfg)
-    if not cent:
-        return None, None
-    rows, below = {}, []
+    rows, below, active = {}, [], False
     for fd in cfg.feed:
+        cent = classify_enabled(cfg, fd.journal or "main")
+        if not cent:
+            continue
+        active = True
         try:
             _ft, items = parse_feed(http_get(fd.url))
         except Exception as e:  # noqa: BLE001
@@ -2305,6 +2374,8 @@ def classify_preview(cfg):
                     f"{it['title'][:60]} · {hit[1]:.2f}")
             else:
                 below.append(it["title"][:60])
+    if not active:
+        return None, None
     return rows, below
 
 
@@ -2924,7 +2995,7 @@ def classify_cmd(config: str = CONFIG_OPT,
         rows, below = classify_preview(cfg)
     if rows is None:
         log("классификатор выключен: нет [classify.section.*] с сидами "
-            "(или engine = off)")
+            "(engine = off, или все журналы вырезаны classify.journals)")
         raise typer.Exit(2)
     t = Table(title="Рубрики по содержанию (порог "
            f"{cfg.classify.threshold}, ниже — секция фида)")

@@ -316,11 +316,9 @@ def test_md_prose_len():
 
 
 def _mk_item(html, link="https://ex.com/a", ft=None):
-    from types import SimpleNamespace
     return {"title": "T", "link": link, "guid": "g1", "date": None,
             "html": html, "author": "",
-            "feed": SimpleNamespace(name="X", full_text=ft, section=None,
-                                     min_article_chars=None)}
+            "feed": fz.feed_runtime({"name": "X", "full_text": ft})}
 
 
 def test_article_md_drops_link_only_stub(monkeypatch, tmp_path):
@@ -402,8 +400,7 @@ def test_article_md_photo_post_survives_junk_gate(monkeypatch, tmp_path):
                         lambda html, *a, **kw: (html.replace(
                             '<img src="https://x/p.jpg"/>',
                             '<img src="img/tiny/p.jpg"/>'), ["p.jpg"], []))
-    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                             min_article_chars=None, journal=None)
+    fd = fz.feed_runtime({"name": "X", "full_text": False})
     item = {"title": "@x posted a photo", "link": "https://t.me/x/1", "guid": "g",
             "date": None, "author": "",
             "html": "<p>Ну надо пробывать, ящитаю ;)</p><img src=\"https://x/p.jpg\"/>",
@@ -425,8 +422,7 @@ def test_article_md_pure_image_dropped(monkeypatch, tmp_path):
                         lambda html, *a, **kw: (html.replace(
                             '<img src="https://x/p.jpg"/>',
                             '<img src="img/tiny/p.jpg"/>'), ["p.jpg"], []))
-    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                             min_article_chars=None, journal=None)
+    fd = fz.feed_runtime({"name": "X", "full_text": False})
     item = {"title": "@x posted a photo", "link": "https://t.me/x/1", "guid": "g",
             "date": None, "author": "",
             "html": '<img src="https://x/p.jpg"/>', "feed": fd}
@@ -440,8 +436,7 @@ def test_journal_authors_in_headings(monkeypatch, tmp_path):
     # journal.authors = true: автор в заголовке главы («Автор · Тема»)
     monkeypatch.setattr(fz, "html_to_md", lambda h: h)
     monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
-    fd = fz.SimpleNamespace(name="tg · x", full_text=False, section=None,
-                             min_article_chars=None, journal="tg")
+    fd = fz.feed_runtime({"name": "tg · x", "full_text": False, "journal": "tg"})
     item = {"title": "Пост о разном", "link": "https://t.me/x/1", "guid": "g",
             "date": None, "author": "Канал Такой-то",
             "html": "<p>" + "текст поста достаточно длинный, чтобы пройти гейт " * 3
@@ -471,6 +466,23 @@ def test_pending_add_dedup():
     # тот же link, другой guid — тоже дубль
     fz._pending_add(pending, [mk("c", "https://x/1")])
     assert [p["guid"] for p in pending] == ["a", "b"]
+
+
+def test_feed_snapshot_roundtrip():
+    # снимок фида — единственная форма в state: все поля, включая journal;
+    # старым записям без journal/summarize feed_runtime допишет None
+    fd = fz.feed_runtime({"name": "X", "full_text": "auto", "journal": "tg",
+                          "summarize": True})
+    snap = fz.feed_snapshot(fd)
+    assert snap == {"name": "X", "full_text": "auto", "section": None,
+                    "min_article_chars": None, "summarize": True,
+                    "journal": "tg"}
+    rt = fz.feed_runtime(snap)
+    assert rt.journal == "tg" and rt.summarize is True
+    # старый снимок без journal/summarize — читатели не падают
+    old = fz.feed_runtime({"name": "Y"})
+    assert old.journal is None and old.summarize is None
+    assert fz._section(old) == "Y"
 
 
 def test_collect_items_feed_dup_dropped(tmp_path, monkeypatch):
@@ -567,6 +579,44 @@ def test_classify_off_and_prepare_none(tmp_path):
     assert fz._classify_prepare(cfg3) is None
 
 
+def test_classify_enabled_journals_filter(tmp_path):
+    # активность решает classify_enabled — единой точкой, не каждый сам
+    cfg = _classify_cfg(tmp_path, Железо=["fpga", "raspberry pi"])
+    assert fz.classify_enabled(cfg, "main") is not None
+    cfg.classify.journals = ["hn"]
+    assert fz.classify_enabled(cfg, "main") is None       # журнал вырезан
+    assert fz.classify_enabled(cfg, "hn") is not None
+    bare = fz.Config(title="Ж", out=str(tmp_path), workdir=str(tmp_path))
+    assert fz.classify_enabled(bare, "main") is None      # классификации нет
+
+
+def test_classify_preview_respects_journals(tmp_path, monkeypatch):
+    # preview показывает ровно то, что уйдёт в выпуск: фиды вырезанных
+    # журналов не читаются; все вырезаны — preview честно молчит
+    fetched = []
+
+    def fake_get(url, **kw):
+        fetched.append(url)
+        return RSS
+
+    monkeypatch.setattr(fz, "http_get", fake_get)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[classify]\njournals = ["main"]\n'
+        '[classify.section."Питон"]\nseeds = ["python", "gil"]\n'
+        '[[feed]]\nname = "Фид"\nurl = "https://x/rss"\n'
+        '[[feed]]\nname = "HN"\nurl = "https://y/rss"\njournal = "hn"\n')
+    cfg = fz._load(str(cfgf))
+    rows, _below = fz.classify_preview(cfg)
+    assert fetched == ["https://x/rss"]      # фид вырезанного журнала не трогаем
+    assert rows is not None
+    cfg.classify.journals = ["нет такого"]
+    rows, below = fz.classify_preview(cfg)
+    assert rows is None and below is None
+
+
 def test_issue_classifies_sections(tmp_path, monkeypatch):
     # выпуск: статьи раскладываются по рубрикам содержания, не по фидам
     py_rss = RSS.replace("Ещё:", "python gil ещё:")
@@ -586,6 +636,35 @@ def test_issue_classifies_sections(tmp_path, monkeypatch):
     assert "Питон" in nav                        # рубрика вместо секции фида
 
 
+def test_journal_layout_sections_and_junk(tmp_path, monkeypatch):
+    # шов раскладки: секции без state и без pandoc; junk выбрасывается,
+    # классификация переносит статью из секции фида в рубрику
+    calls = {"n": 0}
+
+    def fake_article_md(item, cfg, imgdir, opts, failures=None):
+        calls["n"] += 1
+        return None if item["guid"] == "junk" else f"md-{item['guid']}\n"
+
+    monkeypatch.setattr(fz, "article_md", fake_article_md)
+    cfg = _classify_cfg(tmp_path, Питон=["python gil"])
+
+    def mk(guid, title):
+        return {"guid": guid, "link": f"https://x/{guid}", "title": title,
+                "date": None, "author": "", "html": "<p>x</p>",
+                "feed": fz.feed_runtime({"name": f"Фид {guid}"})}
+
+    arts = [mk("a", "python gil отпустили"), mk("junk", "мусор"),
+            mk("b", "борщ и капуста")]
+    parts, first_img, failures = fz.journal_layout(
+        cfg, fz.RunOpts(preset="tiny", text_only=True), arts, "main",
+        str(tmp_path))
+    assert calls["n"] == 3
+    assert parts["Питон"] and "md-a" in parts["Питон"][0]   # по содержанию
+    assert "md-b" in parts["Фид b"][0]                      # ниже порога — секция фида
+    assert "junk" not in {g for g in parts} and first_img is None
+    assert failures == []
+
+
 def test_summarize_extractive():
     text = ("Сначала предложение про python и типизацию, важное для теста. "
             "Потом про то, что код на python надо покрывать тестами. "
@@ -600,6 +679,13 @@ def test_summarize_short_text_empty():
 
 
 # ---------------------------------------------------------------- LLM-движок
+
+def test_llm_run_reset_between_runs():
+    # webui живёт одним процессом: жалоба «LLM не работает» должна
+    # звучать каждый прогон, а не раз за жизнь процесса
+    fz._LLM_FAIL["logged"] = True
+    fz._llm_run_reset()
+    assert fz._LLM_FAIL["logged"] is False
 
 def _llm_cfg(tmp_path, classify=False, summarize=False):
     return fz.Config(
@@ -648,9 +734,7 @@ def test_llm_summarize_used_in_article(monkeypatch, tmp_path):
     monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
     monkeypatch.setattr(fz, "llm_complete",
                         lambda *a, **kw: "Суть: python отпустили GIL.")
-    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                             min_article_chars=None, journal=None,
-                             summarize=True)
+    fd = fz.feed_runtime({"name": "X", "full_text": False, "summarize": True})
     long_text = " ".join(f"Предложение {i} про python и типизацию." for i in range(6))
     item = {"title": "Т", "link": "https://x/1", "guid": "g",
             "date": None, "author": "", "html": f"<p>{long_text}</p>",
@@ -674,9 +758,7 @@ def test_llm_disabled_by_default(monkeypatch, tmp_path):
     cfg.summarize = True
     cent = fz._classify_prepare(cfg)
     fz._classify_item(cfg, cent, "python статья", "<p>python</p>")
-    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                             min_article_chars=None, journal=None,
-                             summarize=True)
+    fd = fz.feed_runtime({"name": "X", "full_text": False, "summarize": True})
     item = {"title": "Т", "link": "", "guid": "g", "date": None, "author": "",
             "html": "<p>" + "текст предложения про всякое. " * 6 + "</p>",
             "feed": fd}
@@ -791,6 +873,17 @@ def test_gc_images_and_stale_retry(tmp_path):
     assert "a" not in st["seen"] and "b" in st["seen"]
 
 
+def test_pool_stale_rule():
+    # единое правило протухания: _retry_fulltext и gc решают одинаково
+    e = {"tries": 5, "added": "2026-10-01T00:00:00"}
+    assert fz._pool_stale(e, datetime.datetime(2026, 10, 20))      # попытки исчерпаны
+    e = {"tries": 1, "added": "2026-10-01T00:00:00"}
+    assert fz._pool_stale(e, datetime.date(2026, 10, 20))           # старость; now — date
+    assert not fz._pool_stale(e, datetime.datetime(2026, 10, 10))  # жив
+    assert fz._pool_stale({"tries": 0, "added": None},              # без даты — древняя
+                          datetime.date(2026, 1, 1))
+
+
 def test_doctor_offline(tmp_path, monkeypatch):
     cfgf = tmp_path / "c.toml"
     cfgf.write_text(
@@ -850,9 +943,7 @@ def test_article_md_summarize_note(monkeypatch, tmp_path):
     # summarize = true: перед телом «Коротко: …»
     monkeypatch.setattr(fz, "html_to_md", lambda h: h)
     monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
-    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                             min_article_chars=None, journal=None,
-                             summarize=True)
+    fd = fz.feed_runtime({"name": "X", "full_text": False, "summarize": True})
     long_text = (" ".join(f"Предложение номер {i} про python и типизацию."
                           for i in range(6)) + " Финал про борщ и капусту.")
     item = {"title": "Т", "link": "https://x/1", "guid": "g",
@@ -864,9 +955,7 @@ def test_article_md_summarize_note(monkeypatch, tmp_path):
                        fz.RunOpts(preset="tiny"))
     assert "**Коротко:**" in md
     # выключено — нет
-    fd2 = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                              min_article_chars=None, journal=None,
-                              summarize=False)
+    fd2 = fz.feed_runtime({"name": "X", "full_text": False, "summarize": False})
     item2 = dict(item, feed=fd2)
     assert "**Коротко:**" not in fz.article_md(
         item2, cfg, str(tmp_path / "img"), fz.RunOpts(preset="tiny"))
