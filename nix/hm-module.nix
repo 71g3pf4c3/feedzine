@@ -48,9 +48,12 @@ in
         Список `feed` сериализуется в `[[feed]]` и соответствует полям
         `load_config` из bin/feedzine.py: title, out, workdir, preset,
         full_text, max_per_feed, text_only, include_tags, exclude_tags,
-        cover, format, img_quality, toc_depth, period, keep_issues,
-        calibre_library, post_issue,
-        feed (name/url/max/section/full_text/include_tags/exclude_tags).
+        cover, cover_pattern, format, img_quality, toc_depth, period,
+        keep_issues, calibre_library, post_issue,
+        feed (name/url/max/section/full_text/include_tags/exclude_tags/
+        journal),
+        journal (attrset: [journal.<id>] с title/period/keep_issues —
+        фиды с journal = "<id>" собираются в отдельные выпуски).
         Пути `out`/`workdir`/`calibre_library` понимают `~`.
 
         Пока модуль включён, `feedzine init` запускать не нужно (и не стоит:

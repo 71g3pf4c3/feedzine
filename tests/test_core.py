@@ -4,6 +4,7 @@ import datetime
 import importlib.util
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -87,16 +88,17 @@ def test_parse_dates():
 
 def test_state_roundtrip(tmp_path):
     st = fz.load_state(str(tmp_path))
-    assert st == {"seen": {}, "issue": 0}
+    assert st == {"seen": {}, "issue": {}, "pending": {}, "last_emit": {}}
     st["seen"]["x"] = "2026-10-04"
-    st["issue"] = 3
+    st["issue"]["main"] = 3
     fz.save_state(str(tmp_path), st)
     assert fz.load_state(str(tmp_path)) == st
 
 
 def test_state_bad_json(tmp_path):
     (tmp_path / "state.json").write_text("{")
-    assert fz.load_state(str(tmp_path)) == {"seen": {}, "issue": 0}
+    assert fz.load_state(str(tmp_path)) == {
+        "seen": {}, "issue": {}, "pending": {}, "last_emit": {}}
 
 
 # ---------------------------------------------------------------- habr
@@ -224,6 +226,59 @@ def test_make_cover_small_screen(tmp_path):
     assert im.size == (300, 400)
     px = list(im.getdata())
     assert sum(1 for v in px if v < 128) > 200   # что-то нарисовано
+
+
+def test_make_cover_patterns_all_render(tmp_path):
+    # каждый узор из PATTERNS рисует что-то и не падает на любом размере
+    from PIL import Image
+    for name in fz.PATTERNS:
+        dst = str(tmp_path / f"cover_{name}.png")
+        assert fz.make_cover(dst, "Ж", 1, "2026-10-04", [], pattern=name) == dst
+        im = Image.open(dst)
+        assert im.mode == "L" and im.size == (600, 800)
+        ink = sum(1 for v in im.getdata() if v < 128)
+        assert ink > 500, f"{name}: пустая обложка"
+
+
+def test_make_cover_deterministic_per_issue(tmp_path):
+    # тот же выпуск -> байт-в-байт та же обложка; другой выпуск -> другая
+    a = fz.make_cover(str(tmp_path / "a.png"), "Мой журнал", 5, "2026-10-04", ["Х"])
+    b = fz.make_cover(str(tmp_path / "b.png"), "Мой журнал", 5, "2026-10-04", ["Х"])
+    c = fz.make_cover(str(tmp_path / "c.png"), "Мой журнал", 6, "2026-10-04", ["Х"])
+    assert Path(a).read_bytes() == Path(b).read_bytes()
+    assert Path(a).read_bytes() != Path(c).read_bytes()
+
+
+def test_cover_text_safe():
+    covered = {ord(c) for c in "ab "}
+    t, dropped = fz.cover_text_safe("a 😀 中 b", covered)
+    assert t == "a   b" and dropped == "中😀"
+    # пробелы всегда остаются, сортировка выброшенного стабильна
+    t2, dropped2 = fz.cover_text_safe("x", covered)      # x тоже не в шрифте
+    assert t2 == "" and dropped2 == "x"
+    # covered=None (нет fontTools/шрифта) — текст не трогаем
+    t3, dropped3 = fz.cover_text_safe("abc 😀", None)
+    assert t3 == "abc 😀" and dropped3 == ""
+
+
+def test_make_cover_drops_uncovered_glyphs(tmp_path):
+    # эмодзи/CJK в заголовке и секциях не роняют обложку и не дают tofu
+    dst = str(tmp_path / "cover.png")
+    assert fz.make_cover(dst, "Журнал 😀 про 中國", 3, "2026-10-04",
+                         ["Хабр 👍", "DTF"], pattern="truchet") == dst
+    from PIL import Image
+    im = Image.open(dst)
+    assert im.mode == "L" and im.size == (600, 800)
+    assert sum(1 for v in im.getdata() if v < 128) > 500
+
+
+def test_cover_pattern_validation():
+    import pytest
+    from pydantic import ValidationError
+    fz.Config.model_validate({"cover_pattern": "mandelbrot"})
+    fz.Config.model_validate({"cover_pattern": "auto"})
+    with pytest.raises(ValidationError):
+        fz.Config.model_validate({"cover_pattern": "kaschtan"})
 
 
 def test_presets_have_cover_size():
@@ -463,7 +518,7 @@ def test_collect_items_dedup_and_order(tmp_path):
     fresh, st = [it for it in items if it["guid"] not in
                  fz.load_state(cfg.workdir)["seen"]][:cfg.feed[0].max], fz.load_state(cfg.workdir)
     assert [f["title"] for f in fresh] == ["новая"]
-    assert st["issue"] == 0
+    assert st["issue"] == {"main": 0}   # плоский старый state мигрирован в журналы
 
 
 def test_section():
@@ -492,7 +547,8 @@ def test_issue_dry_run_no_mutation(tmp_path, monkeypatch):
     assert fz.run_issue(fz._load(str(cfgf)), fz.RunOpts(preset="tiny",
                                                         text_only=True, dry_run=True)) == 0
     # state не тронут: ни seen, ни счётчик выпусков
-    assert fz.load_state(str(tmp_path / "wd")) == {"seen": {}, "issue": 0}
+    assert fz.load_state(str(tmp_path / "wd")) == {
+        "seen": {}, "issue": {}, "pending": {}, "last_emit": {}}
 
 
 # ---------------------------------------------------------------- периоды
@@ -521,20 +577,128 @@ def test_issue_weekly_accumulates_then_forces(tmp_path, monkeypatch):
     # первый прогон: неделя не сменилась — копим, EPUB нет
     assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True)) == 0
     st = fz.load_state(str(tmp_path / "wd"))
-    assert len(st["pending"]) == 2
-    assert st["issue"] == 0 and st.get("last_emit") is None
+    assert len(st["pending"]["main"]) == 2
+    assert st["issue"] == {} and st["last_emit"] == {}
     # pending сериализуем и дат в ISO-строках
-    assert all(isinstance(it["date"], (str, type(None))) for it in st["pending"])
+    assert all(isinstance(it["date"], (str, type(None))) for it in st["pending"]["main"])
     assert list((tmp_path / "out").glob("*.epub")) == []
 
     # force: сводка из накопленного, накопитель пустеет
     assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True, force=True)) == 0
     st = fz.load_state(str(tmp_path / "wd"))
-    assert st["pending"] == []
-    assert st["issue"] == 1
-    assert st["last_emit"]
+    assert st["pending"]["main"] == []
+    assert st["issue"] == {"main": 1}
+    assert st["last_emit"]["main"]
     epubs = list((tmp_path / "out").glob("*.epub"))
     assert len(epubs) == 1
+
+
+# ---------------------------------------------------------------- сниффер
+
+def test_fetch_full_picks_largest_article(monkeypatch):
+    page = ("<html><body>"
+            "<article><p>комментарий</p></article>"
+            "<article><p>" + "текст " * 300 +
+            "<script>tracking()</script></p></article></body></html>")
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: page)
+    html, _ = fz.fetch_full("https://ex.com/a")
+    assert "текст" in html
+    assert "комментарий" not in html     # мелкие article не берём
+    assert "tracking" not in html        # script вырезается
+
+
+def test_fetch_full_sniffs_link_from_summary(monkeypatch):
+    pages = {"https://agg/item": "<html><body><p>обсуждение</p></body></html>",
+             "https://real/post": ("<html><body><article><p>"
+                                   + "статья " * 300 + "</p></article></body></html>")}
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: pages[url])
+    # по ссылке агрегатора контента нет — сниффим прямую ссылку из описания
+    html, _ = fz.fetch_full("https://agg/item",
+                            sniff='читай <a href="https://real/post">тут</a>')
+    assert "статья" in html
+
+
+# ---------------------------------------------------------------- журналы
+
+RSS2 = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>HN</title>
+<item><title>HN статья</title><link>https://hn/1</link><guid>hn-1</guid>
+<pubDate>Thu, 01 Oct 2026 10:00:00 +0000</pubDate>
+<description>сводка</description></item>
+</channel></rss>"""
+
+
+def _route(url, **kw):
+    return RSS if "x/rss" in url else RSS2
+
+
+def test_state_migration_flat_to_journals(tmp_path):
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    (wd / "state.json").write_text(json.dumps(
+        {"seen": {"g1": "2026-10-01"}, "issue": 7,
+         "pending": [{"title": "x"}], "last_emit": "2026-10-01"}))
+    st = fz.load_state(str(wd))
+    assert st["seen"] == {"g1": "2026-10-01"}
+    assert st["issue"] == {"main": 7}
+    assert st["pending"] == {"main": [{"title": "x"}]}
+    assert st["last_emit"] == {"main": "2026-10-01"}
+
+
+def test_journals_split_and_numbering(tmp_path, monkeypatch):
+    monkeypatch.setattr(fz, "http_get", _route)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Главный"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n'
+        '[[feed]]\nname = "HN"\nurl = "https://hn/rss"\njournal = "hn"\n'
+        '[journal.hn]\ntitle = "HN Дайджест"\n')
+    cfg = fz._load(str(cfgf))
+
+    assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True,
+                                        force=True)) == 0
+    main = list((tmp_path / "out").glob("*.epub"))
+    hn = list((tmp_path / "out" / "hn").glob("*.epub"))
+    assert len(main) == 1 and len(hn) == 1
+    assert "Главный_001" in str(main[0])       # каждый журнал — свой №1
+    assert "HN_Дайджест_001" in str(hn[0])
+    st = fz.load_state(str(tmp_path / "wd"))
+    assert st["issue"] == {"main": 1, "hn": 1}
+    assert st["pending"] == {"main": [], "hn": []}
+    assert st["last_emit"]["main"] and st["last_emit"]["hn"]
+
+
+def test_journal_period_independent(tmp_path, monkeypatch):
+    monkeypatch.setattr(fz, "http_get", _route)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Главный"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n'
+        '[[feed]]\nname = "HN"\nurl = "https://hn/rss"\njournal = "hn"\n'
+        '[journal.hn]\nperiod = "week"\n')
+    cfg = fz._load(str(cfgf))
+
+    # main (day) выходит сразу, hn (week) копит до границы
+    assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True)) == 0
+    assert len(list((tmp_path / "out").glob("*.epub"))) == 1
+    assert list((tmp_path / "out" / "hn").glob("*.epub")) == []
+    st = fz.load_state(str(tmp_path / "wd"))
+    assert st["issue"] == {"main": 1}
+    assert len(st["pending"]["hn"]) == 1
+    assert "hn" not in st["last_emit"]
+
+    # новых нет: main молчит, hn продолжает копить
+    assert fz.run_issue(cfg, fz.RunOpts(preset="tiny", text_only=True)) == 0
+    st = fz.load_state(str(tmp_path / "wd"))
+    assert st["issue"] == {"main": 1}
+    assert len(st["pending"]["hn"]) == 1
+
+
+def test_journal_validation():
+    with pytest.raises(ValidationError):
+        fz.Config.model_validate({"journal": {"hn": {"period": "год"}}})
 
 
 # ---------------------------------------------------------------- TUI (textual)

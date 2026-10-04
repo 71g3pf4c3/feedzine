@@ -29,10 +29,11 @@
           textual
           httpx
           pydantic
+          fonttools              # покрытие глифов шрифта обложки (нет tofu)
         ];
         feedzine = pkgs.stdenv.mkDerivation rec {
           pname = "feedzine";
-          version = "0.9.0";
+          version = "0.10.0";
 
           src = self;
 

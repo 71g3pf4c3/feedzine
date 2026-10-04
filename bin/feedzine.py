@@ -21,7 +21,9 @@ import hashlib
 import html as htmllib
 import io
 import json
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -29,6 +31,7 @@ import sys
 import time
 import tomllib
 import xml.etree.ElementTree as ET
+import zlib
 import zipfile
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -178,13 +181,29 @@ def _parse_date(s):
 # ---------------------------------------------------------------- state
 
 def load_state(workdir):
+    """state.json -> dict. Выпускные поля — по журналам; старый плоский
+    формат (issue int / pending list / last_emit str) мигрируется в
+    журнал "main" при чтении, файл не трогаем до первого save."""
     p = f"{workdir}/state.json"
+    st = None
     if os.path.exists(p):
         try:
-            return json.load(open(p))
+            st = json.load(open(p))
         except json.JSONDecodeError:
             pass
-    return {"seen": {}, "issue": 0}
+    if not isinstance(st, dict):
+        st = {}
+    if isinstance(st.get("issue"), int):
+        st["issue"] = {"main": st["issue"]}
+    if isinstance(st.get("pending"), list):
+        st["pending"] = {"main": st.pop("pending")}
+    if isinstance(st.get("last_emit"), str):
+        st["last_emit"] = {"main": st.pop("last_emit")}
+    st.setdefault("seen", {})
+    st.setdefault("issue", {})
+    st.setdefault("pending", {})
+    st.setdefault("last_emit", {})
+    return st
 
 
 def save_state(workdir, st):
@@ -199,18 +218,60 @@ def habr_id(link):
     return m.group(1) if m else None
 
 
-def fetch_full(link):
-    """Полный текст статьи -> (html, author) или None. Habr — kek/v2, прочее — <article>."""
+def _page_block(page, tag):
+    """Самый мясной <tag>…</tag> страницы (по объёму текста, не разметки)."""
+    blocks = re.findall(rf"<{tag}\b[^>]*>(.*?)</{tag}>", page, re.S | re.I)
+    if not blocks:
+        return None
+
+    def text_len(b):
+        return len(re.sub(r"<[^>]+>", " ", b))
+
+    return max(blocks, key=text_len)
+
+
+def _extract_page(page):
+    """Главный контент страницы: article -> main, мусор вырезается.
+
+    На агрегаторах и в комментариях <article> бывает много — берём
+    самый большой по тексту блок, а не первый попавшийся.
+    """
+    for tag in ("article", "main"):
+        blk = _page_block(page, tag)
+        if blk and len(re.sub(r"<[^>]+>", " ", blk)) > 500:
+            return re.sub(r"<(script|style|nav|aside|footer|form)\b[^>]*>.*?</\1>",
+                          "", blk, flags=re.S | re.I)
+    return None
+
+
+def fetch_full(link, sniff=None):
+    """Полный текст статьи -> (html, author) или None.
+
+    Habr — kek/v2. Прочее — SSR-страница: <article>/<main>. Сниффер: если
+    по ссылке контент не взялся (агрегатор: HN-страница обсуждения,
+    редирект-хаб), пробуем первую внешнюю ссылку из описания фида —
+    у link-фидов (HN, rss-bridge) настоящая статья обычно там.
+    """
     hid = habr_id(link)
     if hid:
         d = json.loads(http_get(f"https://habr.com/kek/v2/articles/{hid}/"))
         author = ((d.get("author") or {}).get("fullname")) or ((d.get("author") or {}).get("alias"))
         return d.get("textHtml"), author
-    # generic: <article>…</article> из SSR-страницы
-    page = http_get(link)
-    m = re.search(r"<article\b[^>]*>(.*?)</article>", page, re.S | re.I)
-    if m and len(m.group(1)) > 500:
-        return m.group(1), None
+    html = _extract_page(http_get(link))
+    if html:
+        return html, None
+    if sniff:
+        for u in re.findall(r"https?://[^\s\"'<>]+", sniff):
+            u = u.rstrip(").,];")
+            if u == link:
+                continue
+            try:  # ровно одна попытка по сниффнутой ссылке
+                html = _extract_page(http_get(u))
+            except Exception:  # noqa: BLE001
+                break
+            if html:
+                return html, None
+            break
     return None, None
 
 
@@ -297,19 +358,244 @@ def cover_font_path():
     return cand if os.path.exists(cand) else None
 
 
-def make_cover(dst, title, n, date_str, sections, size=None):
-    """Типографская обложка под e-ink: grayscale, двойная рамка, заголовок,
-    номер выпуска, дата, секции. Размер — от пресета экрана (маленькие
-    читалки получают маленькую обложку, типографика масштабируется).
-    Без PIL — None. Чистый ч/б без полутонов: на e-ink серые плашки
-    превращаются в шум.
+def _escape_art(w, h, cx0, cy0, scale, julia_c, iters):
+    """Фрактал (Мандельброт при julia_c=None, иначе Жюлиа): escape-time на
+    грубой сетке (блок 4px) с апскейлом NEAREST — пиксель-арт выглядит
+    осознанным стилем и не требует numpy."""
+    from PIL import Image
+    K = 4
+    sw, sh = max(2, w // K), max(2, h // K)
+    im = Image.new("L", (sw, sh), 255)
+    put = im.load()
+    ar = sw / sh
+    for j in range(sh):
+        ci = cy0 + (j / sh - 0.5) * scale
+        for i in range(sw):
+            cr = cx0 + (i / sw - 0.5) * scale * ar
+            if julia_c is None:            # Мандельброт: c = точка, z = 0
+                zr, zi, xr, xi = 0.0, 0.0, cr, ci
+            else:                           # Жюлиа: z = точка, c фиксирован
+                zr, zi, xr, xi = cr, ci, julia_c[0], julia_c[1]
+            it = 0
+            while it < iters and zr * zr + zi * zi < 4.0:
+                zr, zi = zr * zr - zi * zi + xr, 2 * zr * zi + xi
+                it += 1
+            # вне множества: чем дольше держится, тем темнее; внутри — чёрный
+            put[i, j] = 0 if it >= iters else max(70, 250 - it * 9)
+    return im.resize((w, h), Image.NEAREST)
+
+
+def _pat_mandelbrot(rng, w, h, sc):
+    """Кроп границы множества Мандельброта в известных «долинах»."""
+    spots = [(-0.7435, 0.1314), (-0.16, 1.0405), (0.2925, 0.0149),
+             (-1.786, 0.0), (-0.7756, 0.2549), (-0.1011, 0.9563)]
+    cx, cy = rng.choice(spots)
+    return _escape_art(w, h, cx, cy, rng.uniform(0.004, 0.05), None, 96)
+
+
+def _pat_julia(rng, w, h, sc):
+    """Множество Жюлиа со случайной c у границы кардиоиды."""
+    cs = [(-0.8, 0.156), (0.285, 0.01), (-0.4, 0.6), (-0.7269, 0.1889),
+          (0.35, 0.35), (-0.54, 0.54)]
+    cx, cy = rng.choice(cs)
+    j = 0.002
+    c = (cx + rng.uniform(-j, j), cy + rng.uniform(-j, j))
+    return _escape_art(w, h, 0.0, 0.0, rng.uniform(2.4, 3.2), c, 96)
+
+
+def _pat_truchet(rng, w, h, sc):
+    """Тайлинг Трюше: дуги или диагонали в случайных ориентациях клеток."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+    s = max(10, round(44 * sc))
+    lw = max(1, round(5 * sc))
+    arcs = rng.random() < 0.65
+    for gy in range(0, h, s):
+        for gx in range(0, w, s):
+            if arcs:
+                if rng.random() < 0.5:      # дуги: верх-лево + низ-право
+                    d.arc([gx, gy, gx + 2 * s, gy + 2 * s], 0, 90, fill=0, width=lw)
+                    d.arc([gx - s, gy - s, gx + s, gy + s], 180, 270, fill=0, width=lw)
+                else:                       # верх-право + низ-лево
+                    d.arc([gx - s, gy, gx + s, gy + 2 * s], 90, 180, fill=0, width=lw)
+                    d.arc([gx, gy - s, gx + 2 * s, gy + s], 270, 360, fill=0, width=lw)
+            elif rng.random() < 0.5:        # диагональ / антидиагональ
+                d.line([(gx, gy), (gx + s, gy + s)], fill=0, width=lw)
+            else:
+                d.line([(gx + s, gy), (gx, gy + s)], fill=0, width=lw)
+    return im
+
+
+def _pat_phyllo(rng, w, h, sc):
+    """Филлотаксис (подсолнух): точки по золотому углу, растут от центра."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+    cx, cy = w / 2, h / 2
+    rmax = min(w, h) / 2 - 2 * sc
+    ga = math.pi * (3 - math.sqrt(5))
+    rot = rng.uniform(0, 2 * math.pi)
+    n = int(w * h / (900 * sc * sc))
+    base = max(1.5, 3.2 * sc)
+    for i in range(n):
+        r = rmax * math.sqrt((i + 1) / n)
+        a = i * ga + rot
+        x, y = cx + r * math.cos(a), cy + r * math.sin(a)
+        rr = base * (0.4 + 0.8 * r / rmax)
+        d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=0)
+    return im
+
+
+def _pat_moire(rng, w, h, sc):
+    """Муар: два пучка концентрических окружностей с близким шагом."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+    lw = max(1, round(2 * sc))
+    cy = h / 2
+    c1 = (w * rng.uniform(0.15, 0.35), cy + rng.uniform(-0.2, 0.2) * h)
+    c2 = (w * rng.uniform(0.65, 0.85), cy + rng.uniform(-0.2, 0.2) * h)
+    step = max(4, round(7 * sc))
+    step2 = step * rng.uniform(1.03, 1.1)
+    rmax = math.hypot(max(w, h), w) / 2
+    for r in range(step, int(rmax), step):
+        d.ellipse([c1[0] - r, c1[1] - r, c1[0] + r, c1[1] + r], outline=0, width=lw)
+    for r in range(round(step2), int(rmax), round(step2)):
+        d.ellipse([c2[0] - r, c2[1] - r, c2[0] + r, c2[1] + r], outline=0, width=lw)
+    return im
+
+
+def _pat_tree(rng, w, h, sc):
+    """Фрактальное дерево из нижнего центра, случайные углы ветвления."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+
+    def branch(x, y, ang, ln, wd, depth):
+        x2, y2 = x + math.cos(ang) * ln, y - math.sin(ang) * ln
+        d.line([(x, y), (x2, y2)], fill=0, width=wd)
+        if depth <= 0 or ln < 3 * sc:
+            return
+        spread = rng.uniform(0.25, 0.6)
+        decay = rng.uniform(0.66, 0.78)
+        branch(x2, y2, ang + spread, ln * decay, max(1, wd - round(2 * sc)), depth - 1)
+        branch(x2, y2, ang - spread, ln * decay, max(1, wd - round(2 * sc)), depth - 1)
+        if rng.random() < 0.3:              # изредка третья ветка
+            branch(x2, y2, ang + rng.uniform(-0.12, 0.12), ln * decay,
+                   max(1, wd - round(2 * sc)), depth - 1)
+
+    branch(w / 2, h - 2 * sc, math.pi / 2, h * rng.uniform(0.24, 0.32),
+           max(2, round(9 * sc)), 9)
+    return im
+
+
+def _pat_ridge(rng, w, h, sc):
+    """Риджлайн: стопка «горизонтов» из суммы синусов с центральным пиком."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+    rows = max(10, round(h / (16 * sc)))
+    rowh = h / (rows + 1)
+    amp = rowh * 1.8
+    comps = [[(rng.uniform(0.5, 2.2) * math.pi, rng.uniform(0, 2 * math.pi),
+               rng.uniform(0.2, 1.0)) for _ in range(4)] for _ in range(rows)]
+    bump = rng.uniform(0.6, 1.0)
+    for r in range(rows):
+        ybase = (r + 1) * rowh + amp / 2
+        pts = []
+        for px_ in range(0, w + 8, 8):
+            t = px_ / w
+            y = ybase - sum(a * math.sin(f * t * 2 * math.pi + p) for f, p, a in comps[r])
+            y -= amp * bump * math.exp(-((t - 0.5) ** 2) / 0.035)
+            pts.append((px_, y))
+        # белая заливка под линией прикрывает задние ряды — эффект хребтов
+        d.polygon(pts + [(w, h), (0, h)], fill=255)
+        d.line(pts, fill=0, width=max(1, round(2 * sc)))
+    return im
+
+
+def _pat_sierpinski(rng, w, h, sc):
+    """Треугольник Серпинского: игра хаоса точками."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+    m = 4 * sc
+    verts = [(w / 2, m), (m, h - m), (w - m, h - m)]
+    x, y = (sum(v[0] for v in verts) / 3, sum(v[1] for v in verts) / 3)
+    dot = max(1, round(1.2 * sc))
+    for _ in range(30000):
+        vx, vy = verts[rng.randrange(3)]
+        x, y = (x + vx) / 2, (y + vy) / 2
+        d.ellipse([x - dot, y - dot, x + dot, y + dot], fill=0)
+    return im
+
+
+PATTERNS = {
+    "mandelbrot": _pat_mandelbrot,
+    "julia": _pat_julia,
+    "truchet": _pat_truchet,
+    "phyllotaxis": _pat_phyllo,
+    "moire": _pat_moire,
+    "tree": _pat_tree,
+    "ridge": _pat_ridge,
+    "sierpinski": _pat_sierpinski,
+}
+
+
+_COVERED_CACHE = {}
+
+
+def _covered_codepoints(font_path):
+    """Кодпоинты шрифта обложки (cmap из fontTools) или None — не проверяем.
+
+    Шрифт может не знать символ (CJK, эмодзи, № у битмаповых дефолтов):
+    FreeType тогда рисует tofu-квадрат. cache — TUI зовёт make_cover
+    на каждый пересбор.
+    """
+    if not font_path:
+        return None
+    if font_path not in _COVERED_CACHE:
+        try:
+            from fontTools.ttLib import TTFont
+            with open(font_path, "rb") as f:
+                _COVERED_CACHE[font_path] = set(TTFont(f).getBestCmap())
+        except Exception:  # noqa: BLE001 — нет fontTools/кривой шрифт: не блокируем
+            _COVERED_CACHE[font_path] = None
+    return _COVERED_CACHE[font_path]
+
+
+def cover_text_safe(text, covered):
+    """Текст без символов, которых нет в шрифте обложки. -> (текст, выброшено).
+
+    Непокрытые символы выкидываются: на e-ink tofu-квадраты хуже
+    отсутствующего символа. Пробелы сохраняются всегда.
+    """
+    if not text or covered is None:
+        return text, ""
+    out, dropped = [], set()
+    for ch in text:
+        if ch.isspace() or ord(ch) in covered:
+            out.append(ch)
+        else:
+            dropped.add(ch)
+    return "".join(out), "".join(sorted(dropped))
+
+
+def make_cover(dst, title, n, date_str, sections, size=None, pattern="auto"):
+    """Генеративная обложка под e-ink: монохромный узор/фрактал во всю
+    ширину, поверх — заголовок, номер на белой плашке, дата, секции.
+    Узор выбирается детерминированно по номеру выпуска и заголовку:
+    пересборка того же выпуска даёт ту же обложку, новый выпуск — новый
+    узор. pattern="auto" — случайный из PATTERNS, иначе фиксированный.
+    Размер — от пресета экрана, вся геометрия масштабируется. Без PIL — None.
     """
     if not HAS_PIL:
         return None
-    from PIL import ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont
 
     W, H = size if size else (600, 800)
-    sc = W / 600.0  # масштаб типографики под ширину обложки
+    sc = W / 600.0  # масштаб под ширину обложки
 
     def px(v):
         return max(1, round(v * sc))
@@ -317,6 +603,14 @@ def make_cover(dst, title, n, date_str, sections, size=None):
     im = Image.new("L", (W, H), 255)
     d = ImageDraw.Draw(im)
     font_path = cover_font_path()
+    # глифы шрифта: неизвестных шрифту символов на обложке не рисуем
+    covered = _covered_codepoints(font_path)
+    dropped = set()
+
+    def safe(text):
+        t, dr = cover_text_safe(text, covered)
+        dropped.update(dr)
+        return t
 
     def font(size):
         try:
@@ -346,29 +640,68 @@ def make_cover(dst, title, n, date_str, sections, size=None):
             lines.append(cur)
         return lines
 
+    # детерминированный seed: тот же выпуск — тот же узор
+    rng = random.Random(zlib.crc32(title.encode())
+                        ^ zlib.crc32(date_str.encode())
+                        ^ (n * 2654435761) & 0xFFFFFFFF)
+    name = pattern if pattern != "auto" else rng.choice(list(PATTERNS))
+    pat_fn = PATTERNS.get(name, _pat_truchet)
+
     M = px(48)  # поля
     # двойная рамка — классический титульный лист
     d.rectangle([M, M, W - M, H - M], outline=0, width=max(2, px(3)))
-    d.rectangle([M + px(8), M + px(8), W - M - px(8), H - M - px(8)], outline=0, width=1)
+    d.rectangle([M + px(8), M + px(8), W - M - px(8), H - M - px(8)],
+                outline=0, width=1)
 
-    y = M + px(70)
-    for line in wrap(title, font(px(40)), W - 2 * (M + px(40))):
-        center(y, line, font(px(40)))
-        y += px(52)
+    # --- раскладка по вертикали: заголовок / узор / дата / секции
+    title = safe(title)
+    title_f, title_lh = font(px(38)), px(50)
+    title_lines = wrap(title, title_f, W - 2 * (M + px(40)))[:3]
+    y_title = M + px(44)
+    for line in title_lines:
+        center(y_title, line, title_f)
+        y_title += title_lh
+    y_title -= title_lh - px(10)  # низ последней строки
 
-    # номер выпуска — центр страницы
-    center(H / 2 - px(90), "№", font(px(36)))
-    center(H / 2 - px(20), str(n), font(px(150)))
-    center(H / 2 + px(160), date_str, font(px(30)))
+    sec_f, sec_lh = font(px(21)), px(28)
+    sections = [safe(s) for s in sections]
+    sec_h = H - M - px(14) - y_title - px(30) - px(80)
+    sec_count = max(0, min(len(sections), 5, int(sec_h // sec_lh)))
+    sec_top = H - M - px(14) - sec_lh * sec_count
+    y = sec_top
+    for s in sections[:sec_count]:
+        if s:
+            center(y, s, sec_f)
+        y += sec_lh
 
-    # секции внизу колонкой — сколько влезает без наезда на дату
-    top = H / 2 + px(200)
-    count = max(0, min(len(sections), 8,
-                       int((H - M - px(16) - top) // px(30))))
-    y = H - M - px(16) - px(30) * count
-    for s in sections[:count]:
-        center(y, s, font(px(22)))
-        y += px(30)
+    date_f = font(px(28))
+    date_y = sec_top - px(46)
+
+    # --- полоса узора во всю ширину между заголовком и датой
+    bx = M + px(12)
+    by0 = y_title + px(26)
+    by1 = date_y - px(26)
+    if by1 - by0 >= px(100):
+        band = pat_fn(rng, W - 2 * bx, by1 - by0, sc)
+        im.paste(band, (bx, by0))
+        d.rectangle([bx, by0, W - bx - 1, by1 - 1], outline=0, width=1)
+
+    # --- номер выпуска на белой плашке поверх узора
+    num_f = font(px(54))
+    num = safe(f"№ {n}")
+    tw = d.textlength(num, font=num_f) or d.textlength("0", font=num_f)
+    ph = px(104)
+    pw = tw + px(56)
+    pcx, pcy = W / 2, (by0 + by1) / 2
+    d.rounded_rectangle([pcx - pw / 2, pcy - ph / 2, pcx + pw / 2, pcy + ph / 2],
+                        radius=px(16), fill=255, outline=0, width=max(2, px(2)))
+    d.text((pcx - tw / 2, pcy - ph / 2 + (ph - px(64)) / 2), num,
+           font=num_f, fill=0)
+
+    center(date_y, safe(date_str), date_f)
+
+    if dropped:
+        log(f"  ! обложка: символов нет в шрифте, выкинул: {' '.join(dropped)}")
 
     im.save(dst, "PNG")
     return dst
@@ -458,6 +791,19 @@ class FeedCfg(BaseModel):
     full_text: bool | str | None = None
     include_tags: list[str] | None = None
     exclude_tags: list[str] | None = None
+    journal: str | None = None      # id отдельного журнала (out/<id>/)
+
+
+class JournalCfg(BaseModel):
+    """[journal.<id>] — настройки отдельного журнала.
+
+    Фиды с journal = "<id>" собираются в свои выпуски: свой заголовок,
+    свой период, своя нумерация. Пустые значения наследуют глобальные.
+    """
+    model_config = ConfigDict(extra="forbid")
+    title: str = ""             # пусто — id журнала (main: cfg.title)
+    period: str = ""            # пусто — глобальный period
+    keep_issues: int = 0        # 0 — глобальный keep_issues
 
 
 class Config(BaseModel):
@@ -473,6 +819,7 @@ class Config(BaseModel):
     include_tags: list[str] = Field(default_factory=list)
     exclude_tags: list[str] = Field(default_factory=list)
     cover: str = "auto"              # auto | image | generated | off
+    cover_pattern: str = "auto"      # узор генерируемой обложки: auto | mandelbrot | ...
     format: str = "epub"             # epub | html | md
     img_quality: int = 0             # 0 = качество пресета; иначе JPEG quality 40..95
     toc_depth: int = 3               # глубина оглавления: 2 — только фиды, 3 — и статьи
@@ -480,6 +827,7 @@ class Config(BaseModel):
     keep_issues: int = 0             # 0 = хранить все; N = оставить последние N
     calibre_library: str = ""        # непусто — добавлять выпуск через calibredb
     post_issue: str = ""             # shell-хук после сборки, %f = путь к выпуску
+    journal: dict[str, JournalCfg] = Field(default_factory=dict)
     feed: list[FeedCfg] = Field(default_factory=list)
 
     @field_validator("preset")
@@ -494,6 +842,13 @@ class Config(BaseModel):
     def _check_cover(cls, v):
         if v not in ("auto", "image", "generated", "off"):
             raise ValueError("cover должен быть auto | image | generated | off")
+        return v
+
+    @field_validator("cover_pattern")
+    @classmethod
+    def _check_cover_pattern(cls, v):
+        if v != "auto" and v not in PATTERNS:
+            raise ValueError(f"cover_pattern должен быть auto | {' | '.join(PATTERNS)}")
         return v
 
     @field_validator("format")
@@ -522,6 +877,14 @@ class Config(BaseModel):
     def _check_period(cls, v):
         if v not in ("day", "week", "month"):
             raise ValueError("period должен быть day | week | month")
+        return v
+
+    @field_validator("journal")
+    @classmethod
+    def _check_journal_periods(cls, v):
+        for jid, jc in v.items():
+            if jc.period and jc.period not in ("day", "week", "month"):
+                raise ValueError(f"journal.{jid}.period должен быть day | week | month")
         return v
 
 
@@ -632,7 +995,7 @@ def article_md(item, cfg, imgdir, opts):
     html, author = item["html"], item["author"]
     if want_full and item["link"]:
         try:
-            full, fauthor = fetch_full(item["link"])
+            full, fauthor = fetch_full(item["link"], sniff=item.get("html"))
             if full:
                 html, author = full, author or fauthor
         except Exception as e:  # noqa: BLE001
@@ -771,59 +1134,59 @@ def _pending_prepare(pending):
     return out
 
 
-def run_issue(cfg, opts):
-    """Сборка выпуска по готовому Config (пути уже раскрыты). -> код возврата.
+def _journal_ids(cfg, st):
+    """id журналов по фидам (порядок конфига); main — если есть фиды без
+    journal или осел pending после миграции старого state."""
+    ids = []
+    for fd in cfg.feed:
+        j = fd.journal or "main"
+        if j not in ids:
+            ids.append(j)
+    if not ids:
+        return ["main"]
+    if st["pending"].get("main") and "main" not in ids:
+        ids.append("main")
+    return ids
 
-    Статьи накапливаются в state.pending (дедуп по seen — как раньше);
-    сводка собирается на границе периода period=day|week|month либо по
-    --force. Провал сборки статьи не теряет — они остаются в накопителе.
+
+def _journal_cfg(cfg, jid):
+    """(title, outdir, period, keep_issues) журнала. main живёт в cfg.out
+    под cfg.title — конфиг без journal работает как раньше, один в один."""
+    jc = cfg.journal.get(jid)
+    title = jc.title if jc and jc.title else (cfg.title if jid == "main" else jid)
+    outdir = cfg.out if jid == "main" else f"{cfg.out}/{sanitize(jid)}"
+    period = (jc.period if jc and jc.period else "") or cfg.period
+    keep = (jc.keep_issues if jc and jc.keep_issues else 0) or cfg.keep_issues
+    return title, outdir, period, keep
+
+
+def _emit_journal(cfg, opts, st, jid, imgdir, now):
+    """Один журнал: граница периода, сборка, пост-шаги.
+
+    False — сборка не удалась (pending сохранён, граница не сдвинута).
+    «Нечего собирать» и «не пора» — это True: журнал в порядке.
     """
-    os.makedirs(cfg.workdir, exist_ok=True)
-    os.makedirs(cfg.out, exist_ok=True)
-    imgdir = f"{cfg.workdir}/img/{opts.preset}"
-
-    with console.status("читаю фиды…"):
-        fresh, all_guids, st = collect_items(cfg, opts)
-
-    pending = st.setdefault("pending", [])
-    _pending_add(pending, fresh)
-
-    now = datetime.datetime.now()
-    ready = opts.force or period_ready(cfg.period, st.get("last_emit"), now)
-
-    if opts.dry_run:
-        log(f"[dry-run] новых {len(fresh)}, в накопителе {len(pending)}; "
-            + ("пора собирать сводку" if ready else f"коплю до границы ({cfg.period})"))
-        for it in pending[:20]:
-            fd = it["feed"]
-            log(f"  {fd.get('section') or fd.get('name') or 'RSS'} :: {it['title']}")
-        return 0
+    title, outdir, period, keep = _journal_cfg(cfg, jid)
+    pending = st["pending"].setdefault(jid, [])
+    ready = opts.force or period_ready(period, st["last_emit"].get(jid), now)
+    if not pending:
+        log(f"{title}: нового нет — выпуск не собираю")
+        return True
+    if not ready:
+        log(f"{title}: накопил {len(pending)} статей — сводка по границе {period}, не сейчас")
+        return True
 
     date_str = now.strftime("%Y-%m-%d")
-    # весь фид прочитан: и попавшее в выпуск, и отсеянное капом, и старое
-    for g in all_guids:
-        st["seen"][g] = date_str
-
-    if not pending:
-        log("нового нет — выпуск не собираю")
-        save_state(cfg.workdir, st)
-        return 0
-
-    if not ready:
-        log(f"накопил {len(pending)} статей — сводка по границе {cfg.period}, не сейчас")
-        save_state(cfg.workdir, st)
-        return 0
-
-    st["issue"] += 1
-    n = st["issue"]
+    st["issue"][jid] = st["issue"].get(jid, 0) + 1
+    n = st["issue"][jid]
     articles = _pending_prepare(pending)
     by_feed = {}
     for it in articles:
         by_feed.setdefault(_section(it["feed"]), []).append(it)
 
-    md = [f"# {cfg.title} №{n}\n\n*{now.strftime('%d %B %Y')}*\n"]
+    md = [f"# {title} №{n}\n\n*{now.strftime('%d %B %Y')}*\n"]
     first_img = None
-    with console.status(f"выпуск №{n}: {len(articles)} статей"):
+    with console.status(f"{title} №{n}: {len(articles)} статей"):
         for fname, items in by_feed.items():
             md.append(f"\n## {fname}\n")
             for it in items:
@@ -833,17 +1196,16 @@ def run_issue(cfg, opts):
                     m2 = re.search(r"!\[[^\]]*\]\(img/[^/]+/([^)]+)\)", m)
                     if m2:
                         first_img = f"{imgdir}/{m2.group(1)}"
-    md_file = f"{cfg.workdir}/issue_{n}.md"
+    md_file = f"{cfg.workdir}/issue_{jid}_{n}.md"
     with open(md_file, "w") as f:
         f.write("\n".join(md))
 
-    # обложка (только для epub): auto — первая картинка выпуска, нет её —
-    # типографская размером с экран пресета
     fmt = opts.format or cfg.format
 
     def gen_cover():
-        return make_cover(f"{cfg.workdir}/cover_{n}.png", cfg.title, n, date_str,
-                          list(by_feed), size=PRESETS[opts.preset].get("cover"))
+        return make_cover(f"{cfg.workdir}/cover_{jid}_{n}.png", title, n, date_str,
+                          list(by_feed), size=PRESETS[opts.preset].get("cover"),
+                          pattern=cfg.cover_pattern)
 
     cover = None
     if fmt == "epub" and cfg.cover != "off":
@@ -856,21 +1218,75 @@ def run_issue(cfg, opts):
         if cover and cover is not first_img:
             log(f"обложка: {cover}")
 
-    out_file = out_name(cfg.out, cfg.title, n, date_str, fmt)
-    if build_output(md_file, out_file, fmt, f"{cfg.title} №{n}",
+    os.makedirs(outdir, exist_ok=True)
+    out_file = out_name(outdir, title, n, date_str, fmt)
+    if build_output(md_file, out_file, fmt, f"{title} №{n}",
                     cfg.workdir, cover=cover, date=date_str,
                     toc_depth=cfg.toc_depth):
         log(f"готово: {out_file}  ({os.path.getsize(out_file) / 1e6:.1f} МБ)")
         if cfg.calibre_library:
             calibre_add(out_file, cfg.calibre_library)
         run_post_issue(cfg.post_issue, out_file)
-        prune_issues(cfg.out, cfg.title, cfg.keep_issues,
+        prune_issues(outdir, title, keep,
                      ext={"epub": "epub", "html": "html", "md": "md"}[fmt])
         # сводка вышла: накопитель пуст, граница зафиксирована
         pending.clear()
-        st["last_emit"] = now.strftime("%Y-%m-%d")
+        st["last_emit"][jid] = date_str
+        return True
+    return False
+
+
+def run_issue(cfg, opts):
+    """Сборка выпусков по готовому Config (пути уже раскрыты). -> код возврата.
+
+    Фиды группируются по журналам (feed.journal, default "main"): у
+    каждого свой заголовок, каталог, период, счётчик и накопитель.
+    seen — общий пул на все журналы. Провал сборки одного журнала не
+    трогает остальные; статьи проваленного остаются в накопителе.
+    """
+    os.makedirs(cfg.workdir, exist_ok=True)
+    os.makedirs(cfg.out, exist_ok=True)
+    imgdir = f"{cfg.workdir}/img/{opts.preset}"
+
+    with console.status("читаю фиды…"):
+        fresh, all_guids, st = collect_items(cfg, opts)
+
+    # свежие статьи — по журналам
+    by_j = {}
+    for it in fresh:
+        by_j.setdefault(it["feed"].journal or "main", []).append(it)
+    for jid, items in by_j.items():
+        _pending_add(st["pending"].setdefault(jid, []), items)
+
+    now = datetime.datetime.now()
+
+    if opts.dry_run:
+        for jid in _journal_ids(cfg, st):
+            title, _outdir, period, _keep = _journal_cfg(cfg, jid)
+            pend = st["pending"].get(jid, [])
+            ready = opts.force or period_ready(period, st["last_emit"].get(jid), now)
+            log(f"[dry-run] {title}: в накопителе {len(pend)}; "
+                + ("пора собирать сводку" if ready else f"коплю до границы ({period})"))
+            for it in pend[:10]:
+                fd = it["feed"]
+                log(f"  {fd.get('section') or fd.get('name') or 'RSS'} :: {it['title']}")
+        return 0
+
+    date_str = now.strftime("%Y-%m-%d")
+    # весь фид прочитан: и попавшее в выпуск, и отсеянное капом, и старое
+    for g in all_guids:
+        st["seen"][g] = date_str
+
+    rc = 0
+    for jid in _journal_ids(cfg, st):
+        try:
+            if not _emit_journal(cfg, opts, st, jid, imgdir, now):
+                rc = 1
+        except Exception as e:  # noqa: BLE001
+            log(f"! журнал {jid}: сборка упала ({e}) — статьи сохранены в накопителе")
+            rc = 1
     save_state(cfg.workdir, st)
-    return 0
+    return rc
 
 
 # ---------------------------------------------------------------- статистика фидов
@@ -1050,7 +1466,9 @@ full_text = "auto"               # auto: полный текст для Habr, с
 max_per_feed = 10                # статей на фид в выпуске
 include_tags = []                # теги статьи из фида: ["python", "go"]; [] = без фильтра
 exclude_tags = []                # напр. ["из песочницы", "перевод"]
-cover = "auto"                   # auto: первая картинка выпуска, нет её — типографская
+cover = "auto"                   # auto: первая картинка выпуска, нет её — сгенерированный узор
+cover_pattern = "auto"            # узор: auto (разный каждый выпуск) | mandelbrot | julia | truchet
+                                 # | phyllotaxis | moire | tree | ridge | sierpinski
 format = "epub"                  # epub | html (один файл с картинками) | md
 img_quality = 0                  # 0 = качество пресета; иначе JPEG quality 40..95
 toc_depth = 3                    # оглавление: 2 — только фиды, 3 — и статьи
@@ -1067,6 +1485,16 @@ url = "https://habr.com/ru/rss/articles/"
 name = "Хабр · Python"
 url = "https://habr.com/ru/rss/hubs/python/"
 max = 5
+
+[[feed]]
+name = "Hacker News"
+url = "https://hnrss.org/frontpage"
+full_text = true            # сниффер: вытащить полный текст статьи по ссылке из фида
+journal = "hn"              # отдельный журнал — выпуски в out/hn/
+
+[journal.hn]                # настройки отдельного журнала (пусто — глобальные)
+title = "HN Дайджест"
+period = "week"             # свой период: main — daily, HN — раз в неделю
 
 [[feed]]
 name = "DTF · главное"
