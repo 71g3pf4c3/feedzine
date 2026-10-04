@@ -961,7 +961,11 @@ def test_tui_toggle_and_cycle(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- backfill
 
 def _rss_age(items):
-    """RSS из (title, aware|naive|None datetime): pubDate RFC-2822 GMT."""
+    """RSS из (title, aware|naive|None datetime): pubDate RFC-2822 GMT.
+
+    Description — объёмная сводка (как у живых фидов): проходит junk-gate
+    и не триггерит auto-полный текст (сводка не огрызок).
+    """
     import datetime as dt
     from email.utils import format_datetime
     rows = ""
@@ -972,7 +976,8 @@ def _rss_age(items):
                 d = d.replace(tzinfo=dt.timezone.utc)
             pub = f"<pubDate>{format_datetime(d, usegmt=True)}</pubDate>"
         rows += (f"<item><title>{t}</title><link>https://x/{i}</link>"
-                 f"<guid>https://x/{i}</guid>{pub}<description>s</description></item>")
+                 f"<guid>https://x/{i}</guid>{pub}"
+                 f"<description>{'статья в деталях. ' * 30}</description></item>")
     return f'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>{rows}</channel></rss>'
 
 
