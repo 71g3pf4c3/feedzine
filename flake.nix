@@ -21,9 +21,18 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        # рантайм-зависимости питона: единый список для пакета, тестов и devShell
+        pyEnv = ps: with ps; [
+          pillow
+          typer
+          rich
+          textual
+          httpx
+          pydantic
+        ];
         feedzine = pkgs.stdenv.mkDerivation rec {
           pname = "feedzine";
-          version = "0.4.0";
+          version = "0.9.0";
 
           src = self;
 
@@ -34,7 +43,9 @@
 
             install -Dm755 bin/feedzine.py $out/share/feedzine/feedzine.py
             install -Dm644 bin/eink.css $out/share/feedzine/eink.css
-            makeWrapper ${pkgs.python3.withPackages (ps: [ ps.pillow ])}/bin/python3 $out/bin/feedzine \
+            install -Dm644 ${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSerif-Bold.ttf \
+              $out/share/feedzine/fonts/cover.ttf
+            makeWrapper ${pkgs.python3.withPackages pyEnv}/bin/python3 $out/bin/feedzine \
               --add-flags "$out/share/feedzine/feedzine.py" \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.pandoc
@@ -91,10 +102,9 @@
 
         checks.unit-tests = pkgs.runCommand "feedzine-unit-tests" {
           nativeBuildInputs = [
-            (pkgs.python3.withPackages (ps: [
-              ps.pytest
-              ps.pillow
-            ]))
+            (pkgs.python3.withPackages (ps:
+              pyEnv ps ++ [ ps.pytest ]
+            ))
             pkgs.pandoc
           ];
         } ''
@@ -108,12 +118,13 @@
 
         devShells.default = pkgs.mkShell {
           packages = [
-            (pkgs.python3.withPackages (ps: [
-              ps.pytest
-              ps.pillow
-            ]))
+            (pkgs.python3.withPackages (ps:
+              pyEnv ps ++ [ ps.pytest ]
+            ))
             pkgs.pandoc
           ];
+          # чтобы make_cover в dev-окружении рендерил тем же шрифтом, что и пакет
+          FEEDZINE_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSerif-Bold.ttf";
         };
       }
     )

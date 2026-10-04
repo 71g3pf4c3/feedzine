@@ -47,8 +47,11 @@ in
         Содержимое ~/.config/feedzine/config.toml.
         Список `feed` сериализуется в `[[feed]]` и соответствует полям
         `load_config` из bin/feedzine.py: title, out, workdir, preset,
-        full_text, max_per_feed, text_only, feed (name/url/max/section/full_text).
-        Пути `out`/`workdir` понимают `~`.
+        full_text, max_per_feed, text_only, include_tags, exclude_tags,
+        cover, format, img_quality, toc_depth, period, keep_issues,
+        calibre_library, post_issue,
+        feed (name/url/max/section/full_text/include_tags/exclude_tags).
+        Пути `out`/`workdir`/`calibre_library` понимают `~`.
 
         Пока модуль включён, `feedzine init` запускать не нужно (и не стоит:
         он перепишет управляемый модулем файл).
