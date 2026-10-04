@@ -169,10 +169,10 @@ def test_demote_headings():
     md = "# Большой\n\nтекст\n\n## Средний\n\n```python\n# не заголовок\nx = 1\n```\n\n#### Мелкий\n"
     out = fz.demote_headings(md)
     lines = out.split("\n")
-    assert "### Большой" in lines            # демо́тнут, не потерян
-    assert "#### Средний" in lines
-    assert "###### Мелкий" in lines          # уровень видимости сохранён относительно
-    assert "# не заголовок" in lines         # fenced-код не тронут
+    assert "#### Большой" in lines           # демо́тнут за горизонт оглавления (h4+)
+    assert "##### Средний" in lines
+    assert "#### Мелкий" in lines             # уже h4 — не трогаем
+    assert "# не заголовок" in lines          # fenced-код не тронут
     assert "x = 1" in lines
 
 
@@ -181,7 +181,7 @@ def test_demote_headings_no_fence_leak():
     md = "```\n# in code\n```\n# real heading\n"
     lines = fz.demote_headings(md).split("\n")
     assert "# in code" in lines
-    assert "### real heading" in lines
+    assert "#### real heading" in lines
 
 
 # ---------------------------------------------------------------- картинки
@@ -400,7 +400,7 @@ def test_article_md_photo_post_survives_junk_gate(monkeypatch, tmp_path):
                             '<img src="https://x/p.jpg"/>',
                             '<img src="img/tiny/p.jpg"/>'), ["p.jpg"], []))
     fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
-                             min_article_chars=None)
+                             min_article_chars=None, journal=None)
     item = {"title": "@x posted a photo", "link": "https://t.me/x/1", "guid": "g",
             "date": None, "author": "",
             "html": "<p>Ну надо пробывать, ящитаю ;)</p><img src=\"https://x/p.jpg\"/>",
@@ -410,6 +410,115 @@ def test_article_md_photo_post_survives_junk_gate(monkeypatch, tmp_path):
     md = fz.article_md(item, cfg, str(tmp_path / "img"),
                        fz.RunOpts(preset="tiny"))
     assert md is not None and "фото" in md
+
+
+def test_article_md_pure_image_dropped(monkeypatch, tmp_path):
+    # чистая картинка без текста — пыль, не контент: в выпуск не идёт
+    monkeypatch.setattr(fz, "html_to_md",
+                        lambda h: h.replace('<img src="img/tiny/p.jpg"/>',
+                                            "![фото](img/tiny/p.jpg)"))
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    monkeypatch.setattr(fz, "rewrite_images",
+                        lambda html, *a, **kw: (html.replace(
+                            '<img src="https://x/p.jpg"/>',
+                            '<img src="img/tiny/p.jpg"/>'), ["p.jpg"], []))
+    fd = fz.SimpleNamespace(name="X", full_text=False, section=None,
+                             min_article_chars=None, journal=None)
+    item = {"title": "@x posted a photo", "link": "https://t.me/x/1", "guid": "g",
+            "date": None, "author": "",
+            "html": '<img src="https://x/p.jpg"/>', "feed": fd}
+    cfg = fz.Config(title="Журнал", out=str(tmp_path / "out"),
+                    workdir=str(tmp_path / "wd"))
+    assert fz.article_md(item, cfg, str(tmp_path / "img"),
+                         fz.RunOpts(preset="tiny")) is None
+
+
+def test_journal_authors_in_headings(monkeypatch, tmp_path):
+    # journal.authors = true: автор в заголовке главы («Автор · Тема»)
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)
+    monkeypatch.setattr(fz, "fetch_full", lambda link, sniff=None: (None, None))
+    fd = fz.SimpleNamespace(name="tg · x", full_text=False, section=None,
+                             min_article_chars=None, journal="tg")
+    item = {"title": "Пост о разном", "link": "https://t.me/x/1", "guid": "g",
+            "date": None, "author": "Канал Такой-то",
+            "html": "<p>" + "текст поста достаточно длинный, чтобы пройти гейт " * 3
+                    + "</p>", "feed": fd}
+    cfg = fz.Config(title="Журнал", out=str(tmp_path / "out"),
+                    workdir=str(tmp_path / "wd"),
+                    journal={"tg": fz.JournalCfg(title="TG", authors=True)})
+    md = fz.article_md(item, cfg, str(tmp_path / "img"),
+                       fz.RunOpts(preset="tiny"))
+    assert "### Канал Такой-то · Пост о разном" in md
+    # без authors — заголовок как был
+    cfg2 = fz.Config(title="Журнал", out=str(tmp_path / "out"),
+                     workdir=str(tmp_path / "wd"))
+    assert "### Пост о разном" in fz.article_md(
+        item, cfg2, str(tmp_path / "img"), fz.RunOpts(preset="tiny"))
+
+
+def test_pending_add_dedup():
+    # один и тот же guid/link дважды в накопитель не попадает
+    fd = fz.SimpleNamespace(name="X", full_text=None, section=None,
+                             min_article_chars=None)
+    mk = lambda g, ln: {"title": "T", "link": ln, "guid": g,
+                        "date": None, "author": "", "html": "<p>x</p>", "feed": fd}
+    pending = []
+    fz._pending_add(pending, [mk("a", "https://x/1"), mk("a", "https://x/1"),
+                              mk("b", "https://x/2")])
+    # тот же link, другой guid — тоже дубль
+    fz._pending_add(pending, [mk("c", "https://x/1")])
+    assert [p["guid"] for p in pending] == ["a", "b"]
+
+
+def test_collect_items_feed_dup_dropped(tmp_path, monkeypatch):
+    # фид отдал статью дважды (guid и link продублированы) — в fresh она одна
+    g1 = "https://habr.com/ru/articles/1090040/"
+    dup_rss = RSS.replace("https://habr.com/ru/articles/1089999/?utm=x", g1) \
+                 .replace("<guid>https://habr.com/ru/articles/1089999/</guid>",
+                          f"<guid>{g1}</guid>")
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: dup_rss)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    fresh, all_guids, _st = fz.collect_items(fz._load(str(cfgf)),
+                                             fz.RunOpts(preset="tiny"))
+    assert [i["guid"] for i in fresh] == [g1]
+    assert all_guids == {g1}
+
+
+def test_collect_bridge_error_whole_feed(tmp_path, monkeypatch):
+    # мостик вернул фид из одной ошибки — это упавший фид, не статьи
+    err = RSS.replace("Статья один &amp; детали", "Bridge returned error 502! (20730)") \
+             .replace("Статья два", "Bridge returned error 502! (20731)")
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: err)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    fresh, all_guids, st = fz.collect_items(fz._load(str(cfgf)),
+                                           fz.RunOpts(preset="tiny"))
+    assert fresh == [] and all_guids == set()
+    assert "https://x/rss" in st["down_feeds"]
+    assert "502" in st["down_feeds"]["https://x/rss"]["error"]
+
+
+def test_collect_bridge_error_mixed(tmp_path, monkeypatch):
+    # ошибка вперемешку с нормальными статьями — ошибка выброшена тихо
+    mixed = RSS.replace(
+        "Статья один &amp; детали", "Bridge returned error 502! (20730)")
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: mixed)
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(
+        'title = "Т"\n'
+        f'out = "{tmp_path / "out"}"\nworkdir = "{tmp_path / "wd"}"\n'
+        '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    fresh, all_guids, st = fz.collect_items(fz._load(str(cfgf)),
+                                           fz.RunOpts(preset="tiny"))
+    assert len(fresh) == 1 and fresh[0]["title"] == "Статья два"
+    assert "https://x/rss" not in st["down_feeds"]
 
 
 def test_retry_fulltext_pool(tmp_path, monkeypatch):
@@ -501,6 +610,7 @@ def test_cover_font_path_env(monkeypatch, tmp_path):
 
 class _FakeResp:
     content = b"ok"
+    headers = {"content-type": "text/plain; charset=utf-8"}
 
     def raise_for_status(self):
         pass
@@ -531,6 +641,47 @@ def test_http_get_retries_exhausted(monkeypatch):
     monkeypatch.setattr(fz.time, "sleep", lambda s: None)
     with pytest.raises(httpx.ConnectError):
         fz.http_get("https://x/", retries=1)
+
+
+def test_http_get_windows1251(monkeypatch):
+    # opennet-style: XML в windows-1251, charset в заголовке не указан
+    body = ('<?xml version="1.0" encoding="windows-1251"?>'
+            "<rss><channel><title>Опеннет</title></channel></rss>").encode("cp1251")
+
+    class R:
+        content = body
+        headers = {"content-type": "text/xml"}
+
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def get(self, url, timeout=None):
+            return R()
+
+    monkeypatch.setattr(fz, "_client", FakeClient())
+    assert fz.http_get("https://opennet.ru/rss.shtml") .startswith("<?xml")
+    assert "Опеннет" in fz.parse_feed(fz.http_get("https://x/"))[0]
+
+
+def test_http_get_charset_header_wins(monkeypatch):
+    # charset из Content-Type приоритетнее XML-декларации
+    body = ("<?xml version='1.0' encoding='utf-8'?>"
+            "<rss><channel><title>Тест</title></channel></rss>").encode("utf-8")
+
+    class R:
+        content = body
+        headers = {"content-type": "application/rss+xml; charset=utf-8"}
+
+        def raise_for_status(self):
+            pass
+
+    class FakeClient:
+        def get(self, url, timeout=None):
+            return R()
+
+    monkeypatch.setattr(fz, "_client", FakeClient())
+    assert "Тест" in fz.http_get("https://x/")
 
 
 # ---------------------------------------------------------------- поставка

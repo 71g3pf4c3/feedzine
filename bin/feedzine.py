@@ -95,6 +95,28 @@ def _get_client():
     return _client
 
 
+def _decode_body(r):
+    """Текст ответа в правильной кодировке: charset из Content-Type,
+    потом XML-декларация (<?xml encoding=…?>), потом meta charset.
+    Ничего не нашли — utf-8. Неизвестная кодировка — utf-8 c replace.
+
+    opennet и прочие старые RSS ходят в windows-1251 без заголовка
+    charset: без этого они превращаются в Ohio of replacement chars.
+    """
+    m = re.search(r"charset=[\"']?([\w-]+)", r.headers.get("content-type") or "")
+    if not m:
+        head = r.content[:2048]
+        m = (re.search(rb"encoding=[\"']([\w-]+)[\"']", head)
+             or re.search(rb"charset=[\"']?([\w-]+)", head))
+    enc = m.group(1) if m else b"utf-8"
+    if isinstance(enc, bytes):
+        enc = enc.decode("ascii", "replace")
+    try:
+        return r.content.decode(enc, "replace")
+    except (LookupError, UnicodeDecodeError):
+        return r.content.decode("utf-8", "replace")
+
+
 def http_get(url, timeout=25, binary=False, retries=2):
     """GET с повторами на сетевые сбои (1 + retries попыток, паузы 2с/4с).
 
@@ -108,7 +130,7 @@ def http_get(url, timeout=25, binary=False, retries=2):
         try:
             r = _get_client().get(url, timeout=timeout)
             r.raise_for_status()
-            return r.content if binary else r.content.decode("utf-8", "replace")
+            return r.content if binary else _decode_body(r)
         except httpx.TransportError as e:
             last = e
     raise last
@@ -121,7 +143,14 @@ def sanitize(s):
 # ---------------------------------------------------------------- RSS / Atom
 
 def parse_feed(xml_text):
-    """RSS 2.0 / Atom -> (имя фида, [item]). Поля: title, link, guid, date(datetime|None), html, author, tags."""
+    """RSS 2.0 / Atom -> (имя фида, [item]). Поля: title, link, guid, date(datetime|None), html, author, tags.
+
+    На вход — уже правильно декодированный текст (кодировку решает
+    http_get). Декларация encoding выпиливается: реэнкодим в utf-8,
+    и ET не должен пытаться перечитать его как windows-1251.
+    """
+    xml_text = re.sub(r"^(<\?xml[^>]*?)\s+encoding=[\"'][\w-]+[\"']([^>]*\?>)",
+                      r"\1\2", xml_text, count=1)
     root = ET.fromstring(xml_text.encode("utf-8", "replace"))
     items = []
     if root.tag == "rss" or root.tag.endswith("}rss"):
@@ -840,6 +869,8 @@ class JournalCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = ""             # пусто — id журнала (main: cfg.title)
     period: str = ""            # пусто — глобальный period
+    keep_issues: int = 0        # 0 = глобальный keep_issues
+    authors: bool = False       # автор в заголовке статьи («Автор · Тема»)
     keep_issues: int = 0        # 0 — глобальный keep_issues
 
 
@@ -967,6 +998,14 @@ def tag_match(tags, include, exclude):
     return True
 
 
+def _bridge_error(it):
+    """rss-bridge при ошибке апстрима отдаёт валидный фид, у которого
+    item — страница ошибки («Bridge returned error …», Details/Trace).
+    Это не статья, в выпуске ей делать нечего."""
+    return bool(re.search(r"bridge returned error", it["title"] or "", re.I)) \
+        or "RssBridge->main" in (it["html"] or "")
+
+
 def collect_items(cfg, opts):
     """Новые статьи всех фидов -> (свежие с капом, все guid'ы фидов, state).
 
@@ -990,6 +1029,20 @@ def collect_items(cfg, opts):
                          "error": _errcode(e), "since": datetime.date.today().isoformat()}
             continue
         down.pop(url, None)
+        # мостик продал ошибку как статью: выбрасываем. Фид целиком из
+        # ошибок — деградация по полной форме (как упавший фид): читатель
+        # увидит в отчёте, смешанные — тихо фильтруются
+        errors = [it for it in items if _bridge_error(it)]
+        if errors:
+            if len(errors) == len(items):
+                down[url] = {"name": fd.name or url, "jid": fd.journal or "main",
+                             "error": errors[0]["title"][:60],
+                             "since": datetime.date.today().isoformat()}
+                log(f"  ! фид {fd.name or url}: мостик вернул ошибку "
+                    f"({errors[0]['title'][:40]})")
+                continue
+            log(f"  {fd.name or url}: выброшено мостин-ошибок {len(errors)}")
+            items = [it for it in items if not _bridge_error(it)]
         if not fd.name:
             # имя фида по умолчанию — его собственный title
             fd.name = ftitle or re.sub(r"^https?://(?:www\.)?", "", url)[:40]
@@ -1001,6 +1054,19 @@ def collect_items(cfg, opts):
         exc = fd.exclude_tags if fd.exclude_tags is not None else cfg.exclude_tags
         # свежие = невидимые, новые сверху (беру хвост — самые новые в RSS идут первыми)
         new = [it for it in items if it["guid"] and it["guid"] not in st["seen"]]
+        # фид может отдать одну статью дважды (phoronix пере-публикует,
+        # GitHub Atom дублирует релизы) — в выпуске ей место одно
+        _seen_guid, _seen_link, deduped = set(), set(), []
+        for it in new:
+            if it["guid"] in _seen_guid:
+                continue
+            if it["link"] and it["link"] in _seen_link:
+                continue
+            _seen_guid.add(it["guid"])
+            if it["link"]:
+                _seen_link.add(it["link"])
+            deduped.append(it)
+        new = deduped
         if inc or exc:
             new = [it for it in new if tag_match(it.get("tags", []), inc, exc)]
         cap = fd.max if fd.max is not None else cfg.max_per_feed
@@ -1018,9 +1084,9 @@ def _section(fd):
 
 
 def demote_headings(md):
-    """Демо́тит ATX-заголовки (#…####) на два уровня вниз: внутренние
-    заголовки статей не должны конкурировать с секциями (##) и
-    заголовками статей (###) в навигации EPUB.
+    """Демо́тит ATX-заголовки (#…###) на три уровня вниз: внутренние
+    заголовки статей не должны попадать в оглавление EPUB — там живут
+    только выпуск (h1), секции (h2) и заголовки статей (h3).
 
     Внутри fenced-кодов (``` … ```) не трогаем: там `#` — комментарий,
     а не заголовок. Заголовки не выбрасываются — только понижаются.
@@ -1032,7 +1098,7 @@ def demote_headings(md):
             out.append(line)
             continue
         if not fence:
-            line = re.sub(r"^(#{1,4})(\s)", r"##\1\2", line)
+            line = re.sub(r"^(#{1,3})(\s)", r"###\1\2", line)
         out.append(line)
     return "\n".join(out)
 
@@ -1125,9 +1191,10 @@ def article_md(item, cfg, imgdir, opts, failures=None):
     body = demote_headings(body)
     min_chars = (fd.min_article_chars if fd.min_article_chars is not None
                  else cfg.min_article_chars)
-    # фото-пост («@x posted a photo» с подписью) — картинка и есть контент:
-    # гейт действует только на текст без картинок
-    if _md_prose_len(body) < min_chars and _md_img_count(body) == 0:
+    # фото-пост с подписью — контент (картинка спасает короткую подпись);
+    # чистая картинка без текста — не контент: в текстовом журнале это пыль
+    prose = _md_prose_len(body)
+    if prose < min_chars and (prose == 0 or _md_img_count(body) == 0):
         log(f"  − пустое не пошло в выпуск: {item['title'][:60]}")
         return None
     d = item["date"].strftime("%d.%m.%Y") if item["date"] else ""
@@ -1144,7 +1211,13 @@ def article_md(item, cfg, imgdir, opts, failures=None):
         notes.append(f"картинок не скачалось: {len(img_fails)} "
                      f"({_errcode_list(img_fails)})")
     note = ("\n\n" + "\n\n".join(f"> ⚠ {n}" for n in notes)) if notes else ""
-    return f"### {item['title']}\n\n{head}{note}\n\n{body}\n"
+    # заголовок статьи: для журналов с authors = true — с автором
+    # (тг-каналы: у постов нет тем, без автора оглавление — каша из огрызков)
+    title = item["title"]
+    jc = cfg.journal.get(getattr(fd, "journal", None) or "main")
+    if jc and jc.authors and author:
+        title = f"{author} · {title}"
+    return f"### {title}\n\n{head}{note}\n\n{body}\n"
 
 
 def _errcode_list(fails):
@@ -1241,14 +1314,21 @@ def _pending_add(pending, fresh):
 
     feed сжимается в снимок {name, full_text, section}: конфиг фида может
     измениться (или фид исчезнуть) до выпуска — сводка не должна зависеть
-    от текущего конфига.
+    от текущего конфига. Дубликаты (guid/link уже в накопителе) не
+    добавляются: статья не должна выйти в выпуске дважды.
     """
+    have = {p.get("guid") for p in pending} | {p.get("link") for p in pending}
     for it in fresh:
+        if it["guid"] in have or (it.get("link") and it["link"] in have):
+            continue
         fd = it.pop("feed")
         it["feed"] = {"name": fd.name, "full_text": fd.full_text, "section": fd.section,
                       "min_article_chars": fd.min_article_chars}
         it["date"] = it["date"].isoformat() if it["date"] else None
         pending.append(it)
+        have.add(it["guid"])
+        if it.get("link"):
+            have.add(it["link"])
 
 
 def _pending_prepare(pending):
