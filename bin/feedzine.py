@@ -1341,9 +1341,6 @@ def run_backfill(cfg, opts, weeks):
     вычищается из накопителей, чтобы regular-поток не выдал двойное;
     накопленное вне окна (без даты/старое) возвращается на место.
     """
-    os.makedirs(cfg.workdir, exist_ok=True)
-    os.makedirs(cfg.out, exist_ok=True)
-    imgdir = f"{cfg.workdir}/img/{opts.preset}"
     st = load_state(cfg.workdir)
 
     plan, window = backfill_plan(cfg, weeks)
@@ -1359,6 +1356,11 @@ def run_backfill(cfg, opts, weeks):
                 log(f"[dry-run] {title} {wk}: {len(_cap_bucket(buckets[wk], cfg))} статей")
         log(f"[dry-run] окно {weeks} нед: {total} статей, {len(window)} guid'ов")
         return 0
+
+    # файловая система трогается только после dry-run-возврата
+    os.makedirs(cfg.workdir, exist_ok=True)
+    os.makedirs(cfg.out, exist_ok=True)
+    imgdir = f"{cfg.workdir}/img/{opts.preset}"
 
     emit_opts = replace(opts, force=True)
     old_pending = {jid: list(p) for jid, p in st["pending"].items()}

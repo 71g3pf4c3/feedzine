@@ -738,11 +738,16 @@ def test_tui_toggle_and_cycle(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- backfill
 
 def _rss_age(items):
-    """RSS из (title, aware-datetime|None): pubDate RFC-2822 или без даты."""
+    """RSS из (title, aware|naive|None datetime): pubDate RFC-2822 GMT."""
+    import datetime as dt
     from email.utils import format_datetime
     rows = ""
     for i, (t, d) in enumerate(items):
-        pub = f"<pubDate>{format_datetime(d, usegmt=True)}</pubDate>" if d else ""
+        pub = ""
+        if d is not None:
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=dt.timezone.utc)
+            pub = f"<pubDate>{format_datetime(d, usegmt=True)}</pubDate>"
         rows += (f"<item><title>{t}</title><link>https://x/{i}</link>"
                  f"<guid>https://x/{i}</guid>{pub}<description>s</description></item>")
     return f'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>{rows}</channel></rss>'
@@ -801,3 +806,60 @@ def test_cap_bucket_per_feed(tmp_path):
     items = [{"title": f"t{i}", "guid": f"g{i}", "date": dt.datetime(2026, 10, 1), "feed": fd}
              for i in range(5)]
     assert [i["title"] for i in fz._cap_bucket(items, cfg)] == ["t0", "t1"]
+
+
+def test_backfill_dry_run_purity(tmp_path, monkeypatch):
+    import datetime as dt
+    now = dt.datetime(2026, 10, 4, 12, 0, 0)
+    xml = _rss_age([("a", now - dt.timedelta(days=3))])
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: xml)
+    cfg = _cfg_for_backfill(tmp_path, '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    assert fz.run_backfill(cfg, fz.RunOpts(preset="tiny", text_only=True,
+                                           dry_run=True), 4) == 0
+    # ни state.json, ни каталогов — файловую систему не трогаем
+    assert not (tmp_path / "state.json").exists()
+    assert not (tmp_path / "out").exists()
+
+
+def test_backfill_empty_bucket_after_cap_skips(tmp_path, monkeypatch):
+    import datetime as dt
+    now = dt.datetime(2026, 10, 4, 12, 0, 0)
+    # неделя есть, но cap = 0: бакет пустеет — выпуск не создаётся,
+    # номер не расходуется, а срезанное капом всё равно прочитано
+    xml = _rss_age([("a", now - dt.timedelta(days=3)), ("b", now - dt.timedelta(days=4))])
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: xml)
+    cfg = _cfg_for_backfill(tmp_path, '[[feed]]\nname = "X"\nurl = "https://x/rss"\nmax = 0\n')
+    assert fz.run_backfill(cfg, fz.RunOpts(preset="tiny", text_only=True), 4) == 0
+    assert list((tmp_path / "out").glob("*.epub")) == []
+    st = fz.load_state(str(tmp_path))
+    assert st["issue"] == {}
+    assert set(st["seen"]) == {"https://x/0", "https://x/1"}   # cap-cut тоже seen
+
+
+def test_backfill_emits_weeks_and_restores_pending(tmp_path, monkeypatch):
+    import datetime as dt
+    now = dt.datetime(2026, 10, 4, 12, 0, 0)
+    w1 = now - dt.timedelta(days=13)
+    w2 = now - dt.timedelta(days=2)
+    xml = _rss_age([("старая неделя", w1), ("новая неделя", w2)])
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: xml)
+    monkeypatch.setattr(fz, "html_to_md", lambda h: h)
+    cfg = _cfg_for_backfill(tmp_path, 'title = "Ретро"\n[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+
+    # в копилке main уже лежит статья вне окна — должна уцелеть
+    fz.save_state(str(tmp_path), {"seen": {}, "issue": {},
+                                  "pending": {"main": [{"guid": "old-1", "title": "копилка",
+                                                         "date": None, "feed": {}}]},
+                                  "last_emit": {}})
+    assert fz.run_backfill(cfg, fz.RunOpts(preset="tiny", text_only=True), 4) == 0
+    epubs = sorted((tmp_path / "out").glob("*.epub"))
+    assert len(epubs) == 2                       # две недели — два выпуска
+    # выпуски датированы последней статьёй своей недели
+    assert w2.strftime("%Y-%m-%d") in epubs[1].name
+    assert w1.strftime("%Y-%m-%d") in epubs[0].name
+    st = fz.load_state(str(tmp_path))
+    assert st["issue"] == {"main": 2}
+    assert set(st["seen"]) == {"https://x/0", "https://x/1"}
+    # копилка восстановлена минус вышедшее
+    assert [p["guid"] for p in st["pending"].get("main", [])] == ["old-1"]
+    assert st["last_emit"]["main"] == w2.strftime("%Y-%m-%d")
