@@ -733,3 +733,71 @@ def test_tui_toggle_and_cycle(tmp_path, monkeypatch):
             assert app.rows[0]["ft"] is True
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------- backfill
+
+def _rss_age(items):
+    """RSS из (title, aware-datetime|None): pubDate RFC-2822 или без даты."""
+    from email.utils import format_datetime
+    rows = ""
+    for i, (t, d) in enumerate(items):
+        pub = f"<pubDate>{format_datetime(d, usegmt=True)}</pubDate>" if d else ""
+        rows += (f"<item><title>{t}</title><link>https://x/{i}</link>"
+                 f"<guid>https://x/{i}</guid>{pub}<description>s</description></item>")
+    return f'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>{rows}</channel></rss>'
+
+
+def _cfg_for_backfill(tmp_path, feed_toml):
+    cfgf = tmp_path / "c.toml"
+    cfgf.write_text(feed_toml)
+    cfg = fz.load_config(str(cfgf))
+    cfg.workdir = str(tmp_path)
+    cfg.out = str(tmp_path / "out")
+    return cfg
+
+
+def test_backfill_plan_window_and_weeks(tmp_path, monkeypatch):
+    import datetime as dt
+    now = dt.datetime(2026, 10, 4, 12, 0, 0)
+    old = now - dt.timedelta(days=200)          # вне окна
+    inwin1 = now - dt.timedelta(days=20)        # ~3 недели назад
+    inwin2 = now - dt.timedelta(days=1)         # текущая неделя
+    xml = _rss_age([("старая за окном", old), ("неделя-3", inwin1),
+                    ("текущая", inwin2), ("без даты", None)])
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: xml)
+    cfg = _cfg_for_backfill(tmp_path, '[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    plan, window = fz.backfill_plan(cfg, 12, now=now)
+    weeks = plan["main"]
+    assert len(window) == 2                     # старая и без даты не в окне
+    assert any("неделя-3" in i["title"] for b in weeks.values() for i in b)
+    assert all("старая за окном" not in i["title"] for b in weeks.values() for i in b)
+    assert len(weeks) == 2                       # две разные ISO-недели
+
+
+def test_backfill_plan_journal_split(tmp_path, monkeypatch):
+    import datetime as dt
+    now = dt.datetime(2026, 10, 4, 12, 0, 0)
+    xml = _rss_age([("a", now - dt.timedelta(days=2))])
+    monkeypatch.setattr(fz, "http_get", lambda url, **kw: xml)
+    cfg = _cfg_for_backfill(tmp_path, '''
+[[feed]]
+name = "Main"
+url = "https://x/rss"
+
+[[feed]]
+name = "HN"
+url = "https://x/hn"
+journal = "hn"
+''')
+    plan, _ = fz.backfill_plan(cfg, 4, now=now)
+    assert set(plan) == {"main", "hn"}
+
+
+def test_cap_bucket_per_feed(tmp_path):
+    import datetime as dt
+    cfg = _cfg_for_backfill(tmp_path, 'max_per_feed = 2\n[[feed]]\nname = "X"\nurl = "https://x/rss"\n')
+    fd = cfg.feed[0]
+    items = [{"title": f"t{i}", "guid": f"g{i}", "date": dt.datetime(2026, 10, 1), "feed": fd}
+             for i in range(5)]
+    assert [i["title"] for i in fz._cap_bucket(items, cfg)] == ["t0", "t1"]

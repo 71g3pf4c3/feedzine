@@ -1289,6 +1289,115 @@ def run_issue(cfg, opts):
     return rc
 
 
+# ---------------------------------------------------------------- backfill
+
+def backfill_plan(cfg, weeks, now=None):
+    """План восстановления истории: ВСЕ статьи фидов в окне последних
+    weeks недель (seen игнорируется), сгруппированные по (журнал,
+    ISO-неделя). Сеть, без state.
+
+    -> (план {jid: {week_key: [items]}}, guid'ы окна)
+    Без даты или старше окна не попадают: дату не определить.
+    Фид отдаёт столько истории, сколько отдаёт — окно режет, но не
+    расширяет доступное.
+    """
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(weeks=weeks)
+    plan, window = {}, set()
+    for fd in cfg.feed:
+        try:
+            _ftitle, items = parse_feed(http_get(fd.url))
+        except Exception as e:  # noqa: BLE001
+            log(f"  ! фид {fd.name or fd.url} не прочитался: {e}")
+            continue
+        for it in items:
+            if not it["guid"] or it["date"] is None or it["date"] < cutoff:
+                continue
+            it["feed"] = fd
+            window.add(it["guid"])
+            jid = fd.journal or "main"
+            plan.setdefault(jid, {}).setdefault(_period_key("week", it["date"]), []).append(it)
+    return plan, window
+
+
+def _cap_bucket(items, cfg):
+    """Кап фида внутри одной недели (fd.max / max_per_feed), порядок фида."""
+    cnt, out = {}, []
+    for it in items:
+        fd = it["feed"]
+        cap = fd.max if fd.max is not None else cfg.max_per_feed
+        c = cnt.get(fd.url, 0)
+        cnt[fd.url] = c + 1
+        if c < cap:
+            out.append(it)
+    return out
+
+
+def run_backfill(cfg, opts, weeks):
+    """Недельные выпуски за последние weeks недель, без учёта seen.
+
+    История берётся из того, что фиды отдают сейчас; выпуски датируются
+    последней статьёй своей недели. Вышедшее помечается прочитанным и
+    вычищается из накопителей, чтобы regular-поток не выдал двойное;
+    накопленное вне окна (без даты/старое) возвращается на место.
+    """
+    os.makedirs(cfg.workdir, exist_ok=True)
+    os.makedirs(cfg.out, exist_ok=True)
+    imgdir = f"{cfg.workdir}/img/{opts.preset}"
+    st = load_state(cfg.workdir)
+
+    plan, window = backfill_plan(cfg, weeks)
+    total = sum(len(b) for j in plan.values() for b in j.values())
+    if not total:
+        log(f"в окне {weeks} нед пусто — фиды не отдают столько истории")
+        return 0
+
+    if opts.dry_run:
+        for jid, buckets in plan.items():
+            title, _o, _p, _k = _journal_cfg(cfg, jid)
+            for wk in sorted(buckets):
+                log(f"[dry-run] {title} {wk}: {len(_cap_bucket(buckets[wk], cfg))} статей")
+        log(f"[dry-run] окно {weeks} нед: {total} статей, {len(window)} guid'ов")
+        return 0
+
+    emit_opts = replace(opts, force=True)
+    old_pending = {jid: list(p) for jid, p in st["pending"].items()}
+    emitted = set()
+    rc = 0
+    for jid, buckets in plan.items():
+        title, _o, _p, _k = _journal_cfg(cfg, jid)
+        for wk in sorted(buckets):
+            items = _cap_bucket(buckets[wk], cfg)
+            if not items:
+                continue
+            # выпуск датируется последней статьёй недели, не «сегодня»
+            wk_now = max(it["date"] for it in items)
+            st["pending"][jid] = []
+            _pending_add(st["pending"][jid], items)
+            try:
+                if not _emit_journal(cfg, emit_opts, st, jid, imgdir, wk_now):
+                    rc = 1
+            except Exception as e:  # noqa: BLE001
+                log(f"! {title} {wk}: сборка упала ({e})")
+                rc = 1
+            finally:
+                st["pending"][jid] = []  # неделя либо вышла, либо нет — целиком
+            emitted.update(it["guid"] for it in items)
+
+    # окно прочитано: и вышедшее, и срезанное капом
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    for g in window:
+        st["seen"][g] = date_str
+    # накопители: вернуть то, что вне окна и не вышло
+    st["pending"] = {}
+    for jid, pend in old_pending.items():
+        rest = [p for p in pend if p.get("guid") not in emitted]
+        if rest:
+            st["pending"][jid] = rest
+    save_state(cfg.workdir, st)
+    return rc
+
+
 # ---------------------------------------------------------------- статистика фидов
 
 @dataclass
@@ -1580,6 +1689,29 @@ def issue_cmd(config: str = CONFIG_OPT,
                                                       dry_run=dry_run,
                                                       format=format,
                                                       force=force)))
+
+
+@app.command("backfill")
+def backfill_cmd(config: str = CONFIG_OPT,
+                 weeks: int = typer.Option(12, "--weeks", "-w", min=1, max=260,
+                                           help="сколько недель истории собрать"),
+                 preset: str = typer.Option("reader", help="пресет картинок"),
+                 text_only: bool = typer.Option(False, "--text-only", help="без картинок"),
+                 dry_run: bool = typer.Option(False, "--dry-run",
+                                               help="план недель; state и файлы не трогать"),
+                 format: str = typer.Option(None, "--format",
+                                           help="epub | html | md (по умолчанию из конфига)")):
+    """пересобрать историю: недельные выпуски за последние N недель"""
+    if preset not in PRESETS:
+        log(f"preset {preset!r} не из {sorted(PRESETS)}")
+        raise typer.Exit(2)
+    if format is not None and format not in ("epub", "html", "md"):
+        log("format должен быть epub | html | md")
+        raise typer.Exit(2)
+    raise typer.Exit(run_backfill(_load(config), RunOpts(preset=preset,
+                                                         text_only=text_only,
+                                                         dry_run=dry_run,
+                                                         format=format), weeks))
 
 
 @app.command("tui")
